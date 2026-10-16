@@ -477,7 +477,22 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
 
   const handleCopyLink = (u: BotUser, e: React.MouseEvent) => {
     e.stopPropagation();
-    const url = u.finalSubscriptionUrl || u.clckUrl || `${window.location.origin}/api/sub/${u.subscriptionToken}`;
+    const url = u.subscriptionType === 'incy'
+      ? [u.clckUrl, u.finalSubscriptionUrl].find((candidate) =>
+          /^https:\/\/clck\.ru\/[A-Za-z0-9_-]+$/i.test(candidate || '')
+        )
+      : [u.finalSubscriptionUrl, u.clckUrl].find((candidate) =>
+          /^happ:\/\/crypt[345]\//i.test(candidate || '')
+        );
+    if (!url) {
+      setChannelSyncResultAlert({
+        type: 'error',
+        text: u.subscriptionType === 'incy'
+          ? 'Короткая ссылка INCY clck.ru еще не создана. Синхронизируйте ссылку и попробуйте снова.'
+          : 'Для пользователя пока не сформирована ссылка HAPP.',
+      });
+      return;
+    }
     navigator.clipboard.writeText(url);
     setCopiedId(u.subscriptionToken);
     setTimeout(() => setCopiedId(null), 2000);
@@ -1191,7 +1206,9 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
                       <div className="font-semibold text-stone-800 flex items-center space-x-1.5">
                         <span>{u.subscriptionName || 'Стандартная подписка'}</span>
                         {u.subscriptionType === 'happ' && (
-                          <span className="px-1.5 py-0.2 bg-indigo-50 text-indigo-700 rounded text-[10px] font-bold">crypt4</span>
+                          <span className="px-1.5 py-0.2 bg-indigo-50 text-indigo-700 rounded text-[10px] font-bold">
+                            {u.finalSubscriptionUrl?.match(/^happ:\/\/(crypt[345])\//i)?.[1] || 'HAPP'}
+                          </span>
                         )}
                         {u.subscriptionType === 'incy' && (
                           <span className="px-1.5 py-0.2 bg-emerald-50 text-emerald-700 rounded text-[10px] font-bold">qsen.ru</span>

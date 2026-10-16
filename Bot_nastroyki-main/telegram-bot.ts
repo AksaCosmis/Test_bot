@@ -1358,7 +1358,8 @@ export class TelegramBotManager {
             feedback.resolvedAt = new Date().toISOString();
           }
         }
-        const subTypeName = isHapp ? 'HAPP (crypt4)' : 'INCY';
+        const happFormatName = `HAPP (${this.options.getStore().happCryptVersion || 'crypt4'})`;
+        const subTypeName = isHapp ? happFormatName : 'INCY';
         const totalServers = 'содержимое центрального источника без преобразований';
         const hours = bot.selfDeleteHours || 72;
 
@@ -1405,7 +1406,7 @@ export class TelegramBotManager {
           name: user.firstName || 'друг',
           subTypeName,
           format: subTypeName,
-          otherFormat: isHapp ? 'INCY' : 'HAPP (crypt4)',
+          otherFormat: isHapp ? 'INCY' : happFormatName,
           totalServers,
           time: issuedTime,
           tz: issuedTz,
@@ -1502,7 +1503,7 @@ export class TelegramBotManager {
 
       const boundDate = user.boundDevice ? new Date(user.boundDevice.boundAt).toLocaleString('ru-RU') : 'Не привязано (свободный слот)';
       const deviceName = user.boundDevice?.clientName || 'Ожидает первого подключения';
-      const formatName = isHapp ? 'HAPP (crypt4)' : 'INCY';
+      const formatName = isHapp ? `HAPP (${this.options.getStore().happCryptVersion || 'crypt4'})` : 'INCY';
       let statusText = isSubActive ? '🟢 Активна' : '⚪ Не получена';
       if (user.isBlocked || user.status === 'blocked') {
         statusText = `⛔ Заблокирована (Предупреждение [${user.sharingWarningCount || 1}])`;
@@ -1516,7 +1517,7 @@ export class TelegramBotManager {
         telegramId: user.telegramId,
         format: formatName,
         subTypeName: formatName,
-        otherFormat: isHapp ? 'INCY' : 'HAPP (crypt4)',
+        otherFormat: isHapp ? 'INCY' : `HAPP (${this.options.getStore().happCryptVersion || 'crypt4'})`,
         status: statusText,
         device: deviceName,
         boundDate,
@@ -1681,7 +1682,7 @@ export class TelegramBotManager {
   private async sendMainMenu(bot: any, chatId: number | string, user: any) {
     const isSubActive = Boolean(user.hasActiveSubscription && user.finalSubscriptionUrl);
     const isHapp = user.subscriptionType === 'happ';
-    const formatName = isHapp ? 'HAPP (crypt4)' : 'INCY';
+    const formatName = isHapp ? `HAPP (${this.options.getStore().happCryptVersion || 'crypt4'})` : 'INCY';
     const store = this.options.getStore();
     const activeSource = store.gitSources?.find((source: any) => source.id === store.activeGitSourceId) || store.gitSources?.[0];
     const sourceChanged = Boolean(user.subscriptionSourceId && activeSource && user.subscriptionSourceId !== activeSource.id);

@@ -122,6 +122,7 @@ export type MediaType = 'none' | 'photo' | 'video' | 'document';
 export type UserSubStatus = 'active' | 'blocked' | 'muted' | 'channel_inactive';
 export type ChannelMembershipStatus = 'creator' | 'administrator' | 'member' | 'restricted' | 'left' | 'kicked';
 export type SubscriptionType = 'happ' | 'incy' | 'single_device_ru' | 'standard' | 'exception';
+type HappCryptVersion = 'crypt3' | 'crypt4' | 'crypt5';
 
 interface GitSourceItem {
   id: string;
@@ -175,7 +176,6 @@ interface ManagedBotItem {
   showQrCode?: boolean; // Configurable QR code toggle (on/off)
   enableFireworks?: boolean; // Visual fireworks/confetti on sub issue
   buttonColor?: string; // Color of buttons in bot
-  shortenIncyUrl?: boolean; // Toggle for shortening INCY links via clck.ru
   channelNoticeMessage?: string; // Custom message when channels subscription required
   chooseFormatMessage?: string; // Custom message when choosing format (HAPP / INCY)
   subIssuedMessage?: string; // Custom template for issued subscription
@@ -461,6 +461,7 @@ export interface RelayGatewayConfig {
 interface StoreData {
   gitSources: GitSourceItem[];
   activeGitSourceId: string;
+  happCryptVersion: HappCryptVersion;
   bots: ManagedBotItem[];
   activeBotId: string;
   replacementTemplates: ReplacementTemplates;
@@ -540,6 +541,7 @@ ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpQYXNzd29yZDEyMw==@se-sto.access-node.net:838
 trojan://TrojanPasswordSecure987@fi-hel.access-node.net:443?security=tls&sni=cdn.cloudflare.com&type=tcp#%F0%9F%87%AB%F0%9F%87%AE%20FI%20-%20Helsinki%20Relay`;
 
 const defaultStore: StoreData = {
+  happCryptVersion: 'crypt4',
   gitSources: [
     {
       id: 'src_gitverse_1',
@@ -976,6 +978,9 @@ function normalizeStore(parsed: any): StoreData {
   if (!parsed || typeof parsed !== 'object') {
     return { ...defaultStore };
   }
+  if (!['crypt3', 'crypt4', 'crypt5'].includes(parsed.happCryptVersion)) {
+    parsed.happCryptVersion = defaultStore.happCryptVersion;
+  }
   // Migrate old format if necessary
   if (!parsed.relayGatewayConfig) {
     parsed.relayGatewayConfig = { ...defaultStore.relayGatewayConfig };
@@ -1164,13 +1169,11 @@ function normalizeStore(parsed: any): StoreData {
       if (rawUrl.includes('puls-dostupa/nodes')) {
         rawUrl = rawUrl.replace('puls-dostupa/nodes/raw/branch/main', 'api/repos/Vaynet/bot/raw/branch/master');
       }
+      if (f.format === 'incy' && !isClckShortUrl(finalUrl)) finalUrl = '';
       if (
-        finalUrl.includes('qsen.ru') ||
-        finalUrl.includes('puls-dostupa') ||
-        (finalUrl.includes('clck.ru') && !/^https:\/\/clck\.ru\/[^\s]+$/i.test(finalUrl))
-      ) {
-        finalUrl = rawUrl;
-      }
+        f.format === 'happ' &&
+        !isHappUrlForVersion(finalUrl, parsed.happCryptVersion as HappCryptVersion)
+      ) finalUrl = '';
       return {
         ...f,
         rawUrl,
@@ -1179,28 +1182,29 @@ function normalizeStore(parsed: any): StoreData {
     });
   }
   if (parsed.users) {
-    const appBase = getAppBaseUrl();
     parsed.users = parsed.users.map((u: any) => {
       let rawUrl = u.gitRawUrl || '';
       let finalUrl = u.finalSubscriptionUrl || u.finalUrl || '';
       const token = u.subscriptionToken || `sub_${u.username || u.telegramId}`;
-      const serverProxySubUrl = `${appBase}/api/sub/${token}`;
 
       if (rawUrl.includes('puls-dostupa/nodes')) {
         rawUrl = rawUrl.replace('puls-dostupa/nodes/raw/branch/main', 'api/repos/Vaynet/bot/raw/branch/master');
       }
 
-      const hasStaleOrInvalidUrl = Boolean(
-        !finalUrl ||
+      const selectedVersion = parsed.happCryptVersion as HappCryptVersion;
+      if (u.subscriptionType === 'incy' && !isClckShortUrl(finalUrl)) {
+        finalUrl = '';
+      } else if (
+        u.subscriptionType === 'happ' &&
+        !isHappUrlForVersion(finalUrl, selectedVersion)
+      ) {
+        finalUrl = '';
+      } else if (
         finalUrl.includes('qsen.ru') ||
         finalUrl.includes('ais-dev') ||
         finalUrl.includes('run.app')
-      );
-
-      if (hasStaleOrInvalidUrl) {
-        finalUrl = u.subscriptionType === 'happ'
-          ? buildHappCryptUrl(rawUrl || serverProxySubUrl)
-          : (rawUrl || serverProxySubUrl);
+      ) {
+        finalUrl = '';
       }
 
       return {
@@ -2019,7 +2023,7 @@ function repositoryPathFromInput(value: string, provider: GitProvider): string {
   }
 }
 
-// Build a HAPP crypt4 deep link from the repository RAW URL.
+// Build the configured HAPP deep-link format from the repository RAW URL.
 const HAPP_CRYPTO_V4_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA3UZ0M3L4K+WjM3vkbQnz
 ozHg/cRbEXvQ6i4A8RVN4OM3rK9kU01FdjyoIgywve8OEKsFnVwERZAQZ1Trv60B
@@ -2035,7 +2039,10 @@ vHuEdc0d7vDmdw0oqCqWj0Xwq86HfORu6tm1A8uRATjb4SzjTKclKuoElVAVa5Jo
 oh/uZMozC65SmDw+N5p6Su8CAwEAAQ==
 -----END PUBLIC KEY-----`;
 
-function buildHappCryptUrl(rawUrl: string): string {
+function buildHappCryptUrl(rawUrl: string, version: HappCryptVersion = store.happCryptVersion): string {
+  if (version === 'crypt5') {
+    return `happ://crypt5/${Buffer.from(rawUrl, 'utf8').toString('base64')}ff`;
+  }
   const encrypted = crypto.publicEncrypt(
     {
       key: HAPP_CRYPTO_V4_PUBLIC_KEY,
@@ -2043,7 +2050,10 @@ function buildHappCryptUrl(rawUrl: string): string {
     },
     Buffer.from(rawUrl, 'utf8')
   );
-  return `happ://crypt4/${encrypted.toString('base64')}`;
+  const ciphertext = encrypted.toString('base64');
+  return version === 'crypt3'
+    ? `happ://crypt3/CH/${ciphertext}`
+    : `happ://crypt4/${ciphertext}`;
 }
 
 function convertToHappCryptUrl(rawUrl: string, _token: string, _userTelegramId: number): string {
@@ -2093,7 +2103,18 @@ function applyUserIncyShortUrl(user: any, targetUrl: string, shortUrl: string): 
   if (repoFile) repoFile.finalUrl = shortUrl;
 }
 
-function applyUserHappCryptUrl(user: any, targetUrl: string, happUrl: string): void {
+function isHappUrlForVersion(url: string | undefined, version: HappCryptVersion): boolean {
+  if (!url) return false;
+  if (version === 'crypt3') return url.startsWith('happ://crypt3/CH/');
+  return url.startsWith(`happ://${version}/`);
+}
+
+function applyUserHappCryptUrl(
+  user: any,
+  targetUrl: string,
+  happUrl: string,
+  version: HappCryptVersion = store.happCryptVersion
+): void {
   user.finalSubscriptionUrl = happUrl;
   user.finalUrl = happUrl;
   user.clckUrl = happUrl;
@@ -2102,12 +2123,50 @@ function applyUserHappCryptUrl(user: any, targetUrl: string, happUrl: string): v
     (item: any) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
   );
   if (subscription) subscription.finalUrl = happUrl;
+  for (const item of user.sourceSubscriptions || []) {
+    if (item.format === 'happ' && item !== subscription && item.rawUrl) {
+      item.finalUrl = buildHappCryptUrl(item.rawUrl, version);
+    }
+  }
   const repoFile = store.repoFiles?.find(
     (item: RepoUserFile) =>
       item.sourceId === user.subscriptionSourceId &&
       item.filePath === user.gitFilePath
   );
   if (repoFile) repoFile.finalUrl = happUrl;
+}
+
+function migrateHappLinks(version: HappCryptVersion): number {
+  let updatedCount = 0;
+  for (const user of store.users || []) {
+    if (
+      user.subscriptionType !== 'happ' ||
+      (!user.finalSubscriptionUrl && !user.gitRawUrl && !user.gitFilePath)
+    ) continue;
+    const targetUrl = getUserSubscriptionTargetUrl(user);
+    if (!targetUrl) continue;
+    applyUserHappCryptUrl(user, targetUrl, buildHappCryptUrl(targetUrl, version), version);
+    user.subscriptionName = `HAPP (${version})`;
+    updatedCount++;
+  }
+  for (const exclusion of store.exclusions || []) {
+    if (exclusion.gitRawUrl) {
+      exclusion.happUrl = buildHappCryptUrl(exclusion.gitRawUrl, version);
+      updatedCount++;
+    }
+  }
+  for (const repoFile of store.repoFiles || []) {
+    if (repoFile.format !== 'happ') continue;
+    const matchingUser = store.users?.find(
+      (user) => user.subscriptionSourceId === repoFile.sourceId && user.gitFilePath === repoFile.filePath
+    );
+    if (!matchingUser && repoFile.rawUrl) {
+      repoFile.finalUrl = buildHappCryptUrl(repoFile.rawUrl, version);
+      updatedCount++;
+    }
+  }
+  saveStore();
+  return updatedCount;
 }
 
 // Qsen's UI posts the URL to clck.ru and returns a clck.ru short URL.
@@ -2853,8 +2912,8 @@ async function ensureUserRepoFile(
     // Format is INCY: direct gateway URL or direct GitVerse raw URL
     finalUrl = await shortenIncyUrl(targetBaseUrl, tokenSafe);
   }
-  if (format === 'happ' && !finalUrl.startsWith('happ://crypt4/')) {
-    throw new Error('Не удалось сформировать HAPP-ссылку формата crypt4.');
+  if (format === 'happ' && !isHappUrlForVersion(finalUrl, store.happCryptVersion)) {
+    throw new Error(`Не удалось сформировать HAPP-ссылку формата ${store.happCryptVersion}.`);
   }
   if (format === 'incy' && !isClckShortUrl(finalUrl)) {
     throw new Error('Не удалось сформировать короткую INCY-ссылку clck.ru.');
@@ -2911,7 +2970,7 @@ async function ensureUserRepoFile(
   user.clckUrl = finalUrl;
   user.clckTargetUrl = targetBaseUrl;
   user.subscriptionType = format;
-  user.subscriptionName = format === 'happ' ? 'HAPP (crypt4)' : 'INCY (VLESS)';
+  user.subscriptionName = format === 'happ' ? `HAPP (${store.happCryptVersion})` : 'INCY (VLESS)';
   user.hasActiveSubscription = true;
   if (!user.receivedAt) {
     user.receivedAt = new Date().toISOString();
@@ -4646,6 +4705,34 @@ app.get('/api/bots', (req, res) => {
   });
 });
 
+app.get('/api/subscription-settings', (_req, res) => {
+  res.json({ happCryptVersion: store.happCryptVersion });
+});
+
+app.post('/api/subscription-settings', (req, res) => {
+  const version = req.body?.happCryptVersion;
+  if (!['crypt3', 'crypt4', 'crypt5'].includes(version)) {
+    return res.status(400).json({ success: false, message: 'Выберите формат HAPP crypt3, crypt4 или crypt5.' });
+  }
+
+  try {
+    store.happCryptVersion = version as HappCryptVersion;
+    const updatedLinks = migrateHappLinks(store.happCryptVersion);
+    res.json({
+      success: true,
+      happCryptVersion: store.happCryptVersion,
+      updatedLinks,
+      message: `Формат HAPP изменен на ${store.happCryptVersion}. Обновлено подписок: ${updatedLinks}.`,
+    });
+  } catch (err: any) {
+    console.error('[HAPP link migration failed]:', err.message);
+    res.status(500).json({
+      success: false,
+      message: `Не удалось полностью обновить HAPP-ссылки: ${err.message}`,
+    });
+  }
+});
+
 app.post('/api/bots', (req, res) => {
   const item: Partial<ManagedBotItem> = req.body;
   const existingIdx = store.bots.findIndex((b) => b.id === item.id);
@@ -4783,8 +4870,8 @@ app.post('/api/replacement-templates', (req, res) => {
 app.get('/api/exclusions', (req, res) => {
   // Synchronize dynamic status from store.users for channel exclusions
   for (const excl of store.exclusions || []) {
-    if (excl.gitRawUrl && !excl.happUrl?.startsWith('happ://crypt4/')) {
-      excl.happUrl = buildHappCryptUrl(excl.gitRawUrl);
+    if (excl.gitRawUrl && !isHappUrlForVersion(excl.happUrl, store.happCryptVersion)) {
+      excl.happUrl = buildHappCryptUrl(excl.gitRawUrl, store.happCryptVersion);
     }
     if (excl.isChannelExclusion) {
       const user = store.users?.find((u) => u.id === excl.userId || u.subscriptionToken === excl.token);
@@ -4918,9 +5005,10 @@ app.post('/api/exclusions', async (req, res) => {
   try {
     clckUrl = await shortenIncyUrl(gitRawUrl, token);
   } catch (err: any) {
-    console.warn('[Exclusion clck.ru warning]:', err.message);
+    console.error('[Exclusion clck.ru shortening failed]:', err.message);
+    return res.status(502).json({ success: false, message: `Не удалось создать короткую INCY-ссылку: ${err.message}` });
   }
-  const incyUrl = clckUrl || gitRawUrl;
+  const incyUrl = clckUrl;
 
   const newExcl: ExclusionSubscription = {
     id: `excl_${Date.now()}`,
@@ -5173,13 +5261,18 @@ app.post('/api/exclusions/:id/sync', async (req, res) => {
   }
 
   // Ensure clck.ru link is generated and up to date
-  if (target.gitRawUrl && (!target.clckUrl || !target.clckUrl.startsWith('https://clck.ru/'))) {
+  if (target.gitRawUrl && !isClckShortUrl(target.clckUrl)) {
     try {
       const short = await shortenIncyUrl(target.gitRawUrl, target.token);
       target.clckUrl = short;
       target.incyUrl = short;
     } catch (e: any) {
-      console.warn('[Exclusion sync clck notice]:', e.message);
+      console.error('[Exclusion sync clck shortening failed]:', e.message);
+      saveStore();
+      return res.status(502).json({
+        success: false,
+        message: `Файл синхронизирован, но короткую INCY-ссылку создать не удалось: ${e.message}`,
+      });
     }
   }
 
@@ -5203,8 +5296,14 @@ app.post('/api/exclusions/:id/shorten-clck', async (req, res) => {
   const target = store.exclusions.find((e) => e.id === id);
   if (!target) return res.status(404).json({ success: false, message: 'Исключение не найдено' });
 
-  const rawUrl = target.gitRawUrl || `${process.env.APP_URL || 'https://puls-access.onrender.com'}/api/sub/${target.token}`;
-  const shortUrl = await shortenIncyUrl(rawUrl, target.token);
+  const rawUrl = target.gitRawUrl || `${getDirectAppBaseUrl()}/api/sub/${target.token}`;
+  let shortUrl: string;
+  try {
+    shortUrl = await shortenIncyUrl(rawUrl, target.token);
+  } catch (err: any) {
+    console.error(`[Exclusion manual shorten failed] ${target.token}:`, err.message);
+    return res.status(502).json({ success: false, message: err.message });
+  }
   target.clckUrl = shortUrl;
   target.incyUrl = shortUrl;
   saveStore();
@@ -5308,9 +5407,10 @@ app.post('/api/exclusions/channel-grant', async (req, res) => {
   try {
     clckUrl = await shortenIncyUrl(gitRawUrl, token);
   } catch (err: any) {
-    console.warn('[Channel Exclusion clck error]:', err.message);
+    console.error('[Channel Exclusion clck shortening failed]:', err.message);
+    return res.status(502).json({ success: false, message: `Не удалось создать короткую INCY-ссылку: ${err.message}` });
   }
-  const incyUrl = clckUrl || gitRawUrl;
+  const incyUrl = clckUrl;
 
   const userId = `usr_chexcl_${Date.now()}_${randomSuffix}`;
   const isSubscribed = channelMembership !== 'left';
@@ -5323,7 +5423,7 @@ app.post('/api/exclusions/channel-grant', async (req, res) => {
     firstName: userFirst,
     joinedAt: new Date().toISOString(),
     receivedAt: new Date().toISOString(),
-    subscriptionName: format === 'happ' ? 'HAPP (crypt4) - Канал 1 устр.' : 'INCY (VLESS) - Канал 1 устр.',
+    subscriptionName: format === 'happ' ? `HAPP (${store.happCryptVersion}) - Канал 1 устр.` : 'INCY (VLESS) - Канал 1 устр.',
     subscriptionType: format === 'happ' ? 'happ' : 'incy',
     status: isSubscribed ? 'active' : 'channel_inactive',
     mutedUntil: null,
@@ -5751,22 +5851,22 @@ app.get('/api/users', async (req, res) => {
   for (const user of store.users || []) {
     if (
       user.subscriptionType === 'happ' &&
-      (!user.finalSubscriptionUrl?.startsWith('happ://crypt4/') ||
+      (!isHappUrlForVersion(user.finalSubscriptionUrl, store.happCryptVersion) ||
         user.clckTargetUrl !== getUserSubscriptionTargetUrl(user))
     ) {
       const subscription = user.sourceSubscriptions?.find(
         (item) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
       );
-      const rawUrl = subscription?.rawUrl || user.gitRawUrl;
-      if (rawUrl) {
-        const link = buildHappCryptUrl(rawUrl);
-        applyUserHappCryptUrl(user, rawUrl, link);
+      const targetUrl = getUserSubscriptionTargetUrl(user);
+      if (subscription?.rawUrl || user.gitRawUrl) {
+        const link = buildHappCryptUrl(targetUrl, store.happCryptVersion);
+        applyUserHappCryptUrl(user, targetUrl, link, store.happCryptVersion);
+        user.subscriptionName = `HAPP (${store.happCryptVersion})`;
         migratedHappLinks = true;
       }
     } else if (
       user.subscriptionType === 'incy' &&
-      user.hasActiveSubscription &&
-      user.gitFilePath &&
+      (user.gitFilePath || user.gitRawUrl) &&
       (!isClckShortUrl(user.finalSubscriptionUrl) ||
         user.clckTargetUrl !== getUserSubscriptionTargetUrl(user))
     ) {
@@ -5775,6 +5875,7 @@ app.get('/api/users', async (req, res) => {
   }
 
   let nextUserIndex = 0;
+  let failedIncyMigrations = false;
   const workers = Array.from({ length: Math.min(4, staleIncyUsers.length) }, async () => {
     while (nextUserIndex < staleIncyUsers.length) {
       const user = staleIncyUsers[nextUserIndex++];
@@ -5782,11 +5883,23 @@ app.get('/api/users', async (req, res) => {
         await resolveUserDisplayKey(user);
       } catch (err: any) {
         console.warn(`[User INCY link migration] Failed for ${user.telegramId}:`, err.message);
+        user.finalSubscriptionUrl = undefined;
+        user.finalUrl = undefined;
+        user.clckUrl = undefined;
+        const subscription = user.sourceSubscriptions?.find(
+          (item) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
+        );
+        if (subscription) subscription.finalUrl = '';
+        const repoFile = store.repoFiles?.find(
+          (item) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
+        );
+        if (repoFile) repoFile.finalUrl = '';
+        failedIncyMigrations = true;
       }
     }
   });
   await Promise.all(workers);
-  if (migratedHappLinks) saveStore();
+  if (migratedHappLinks || failedIncyMigrations) saveStore();
   res.json({ users: store.users });
 });
 
@@ -5808,7 +5921,7 @@ app.post('/api/users', (req, res) => {
     lastName: lastName || '',
     joinedAt: existingIndex >= 0 ? store.users[existingIndex].joinedAt : nowIso,
     receivedAt: nowIso,
-    subscriptionName: subscriptionName || (subscriptionType === 'happ' ? 'HAPP (crypt4) - VLESS' : 'INCY (GitVerse RAW)'),
+    subscriptionName: subscriptionName || (subscriptionType === 'happ' ? `HAPP (${store.happCryptVersion}) - VLESS` : 'INCY (GitVerse RAW)'),
     subscriptionType: subscriptionType || 'happ',
     status: channelMembership === 'left' ? 'channel_inactive' : 'active',
     mutedUntil: null,
@@ -10988,7 +11101,7 @@ app.post('/api/bot/simulate', async (req, res) => {
     return res.json({
       response: {
         text: `🔑 **У вас уже выпущена персональная подписка!**\n\n` +
-          `🏷 **Текущий формат:** ${dbUser.subscriptionType === 'happ' ? 'HAPP (crypt4)' : 'INCY / VLESS'}\n` +
+          `🏷 **Текущий формат:** ${dbUser.subscriptionType === 'happ' ? `HAPP (${store.happCryptVersion})` : 'INCY / VLESS'}\n` +
           `📱 **Привязанное устройство:** ${dbUser.boundDevice?.clientName || '1 устройство'}\n` +
           `🕒 **Дата привязки:** ${boundDate}\n\n` +
           `💡 *Подписка выдается 1 раз на ваше персональное устройство. Вы можете в любой момент переключить формат между HAPP и INCY без потери доступа:*`,
@@ -11079,7 +11192,7 @@ app.post('/api/bot/simulate', async (req, res) => {
       saveStore();
     }
     const isSubActive = Boolean(dbUser.hasActiveSubscription && dbUser.finalSubscriptionUrl);
-    const formatName = dbUser.subscriptionType === 'happ' ? 'HAPP (crypt4)' : 'INCY';
+    const formatName = dbUser.subscriptionType === 'happ' ? `HAPP (${store.happCryptVersion})` : 'INCY';
     const activeSource = store.gitSources?.find((source) => source.id === store.activeGitSourceId) || store.gitSources?.[0];
     const sourceChanged = Boolean(dbUser.subscriptionSourceId && activeSource && dbUser.subscriptionSourceId !== activeSource.id);
     const sourceChangeNotice = sourceChanged
@@ -11152,7 +11265,7 @@ app.post('/api/bot/simulate', async (req, res) => {
 
     const displayKey = await resolveUserDisplayKey(dbUser);
     const isHapp = dbUser.subscriptionType === 'happ';
-    const formatName = isHapp ? 'HAPP (crypt4)' : 'INCY';
+    const formatName = isHapp ? `HAPP (${store.happCryptVersion})` : 'INCY';
     const boundDate = dbUser.boundDevice ? new Date(dbUser.boundDevice.boundAt).toLocaleString('ru-RU') : 'Не привязано (свободный слот)';
     const deviceName = dbUser.boundDevice?.clientName || 'Ожидает первого подключения';
     const statusText = dbUser.hasActiveSubscription ? '🟢 Активна' : '⚪ Не получена';
@@ -11165,7 +11278,7 @@ app.post('/api/bot/simulate', async (req, res) => {
       telegramId: dbUser.telegramId,
       format: formatName,
       subTypeName: formatName,
-      otherFormat: isHapp ? 'INCY' : 'HAPP (crypt4)',
+      otherFormat: isHapp ? 'INCY' : `HAPP (${store.happCryptVersion})`,
       status: statusText,
       device: deviceName,
       boundDate,
@@ -11368,7 +11481,7 @@ app.post('/api/bot/simulate', async (req, res) => {
       }
     }
 
-    const subTypeName = isHapp ? 'HAPP (crypt4)' : 'INCY';
+    const subTypeName = isHapp ? `HAPP (${store.happCryptVersion})` : 'INCY';
     const totalServers = 'содержимое центрального источника без преобразований';
 
     dbUser.receivedAt = dbUser.receivedAt || new Date().toISOString();
@@ -11396,7 +11509,7 @@ app.post('/api/bot/simulate', async (req, res) => {
       name: dbUser.firstName || 'друг',
       subTypeName,
       format: subTypeName,
-      otherFormat: isHapp ? 'INCY' : 'HAPP (crypt4)',
+      otherFormat: isHapp ? 'INCY' : `HAPP (${store.happCryptVersion})`,
       totalServers,
       time: clientDeviceTime,
       tz: clientDeviceTz,

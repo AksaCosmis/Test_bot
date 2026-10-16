@@ -14,7 +14,8 @@ import {
   DockerConfig,
   SyncHealthReport,
   SystemLogEntry,
-  DeepAuditResult
+  DeepAuditResult,
+  HappCryptVersion
 } from '../types';
 
 const API_BASE = '/api';
@@ -84,6 +85,31 @@ export async function fetchBots(): Promise<{ bots: ManagedBotItem[]; activeBotId
   const res = await fetch(`${API_BASE}/bots`);
   if (!res.ok) throw new Error('Ошибка загрузки Telegram ботов');
   return res.json();
+}
+
+export async function fetchSubscriptionSettings(): Promise<{ happCryptVersion: HappCryptVersion }> {
+  const res = await fetch(`${API_BASE}/subscription-settings`);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message || 'Ошибка загрузки формата HAPP');
+  return data;
+}
+
+export async function saveHappCryptVersion(happCryptVersion: HappCryptVersion): Promise<{
+  success: boolean;
+  happCryptVersion: HappCryptVersion;
+  updatedLinks: number;
+  message: string;
+}> {
+  const res = await fetch(`${API_BASE}/subscription-settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ happCryptVersion }),
+  });
+  const data = await res.json();
+  if (!res.ok || data.success === false) {
+    throw new Error(data.message || 'Ошибка обновления формата HAPP');
+  }
+  return data;
 }
 
 export async function saveBot(bot: Partial<ManagedBotItem>): Promise<{ success: boolean; bot: ManagedBotItem; bots: ManagedBotItem[] }> {

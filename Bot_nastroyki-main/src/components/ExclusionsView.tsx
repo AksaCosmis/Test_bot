@@ -65,6 +65,10 @@ interface ExclusionsViewProps {
   onRefreshExclusions?: () => Promise<void>;
 }
 
+function getClckShortUrl(url?: string): string {
+  return url && /^https:\/\/clck\.ru\/[A-Za-z0-9_-]+$/i.test(url) ? url : '';
+}
+
 export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
   exclusions,
   activeGitSource,
@@ -190,6 +194,10 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
   const teamExclusions = filteredExclusions.filter((e) => !e.isChannelExclusion && !e.isTemporary);
 
   const handleCopy = (text: string, key: string) => {
+    if (!text) {
+      alert('Короткая ссылка clck.ru пока не создана. Нажмите кнопку обновления clck.');
+      return;
+    }
     navigator.clipboard.writeText(text);
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
@@ -409,11 +417,13 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
       return;
     }
 
-    const directSubUrl = `${window.location.origin}/api/sub/${qrModalExcl.token}`;
-    const rawUrl = qrModalExcl.gitRawUrl || directSubUrl;
-    const incyUrl = (qrModalExcl.clckUrl && !qrModalExcl.clckUrl.includes('clck.ru/3W')) ? qrModalExcl.clckUrl : rawUrl;
+    const incyUrl = getClckShortUrl(qrModalExcl.clckUrl);
     const happUrl = qrModalExcl.happUrl || '';
     const targetUrl = qrFormat === 'happ' ? happUrl : incyUrl;
+    if (!targetUrl) {
+      setQrDataUrl(null);
+      return;
+    }
 
     QRCode.toDataURL(targetUrl, {
       width: 240,
@@ -896,7 +906,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                 const directSubUrl = `${window.location.origin}/api/sub/${excl.token}`;
                 const rawUrl = excl.gitRawUrl || directSubUrl;
                 const happUrl = excl.happUrl || '';
-                const incyUrl = (excl.clckUrl && !excl.clckUrl.includes('clck.ru/3W')) ? excl.clckUrl : rawUrl;
+                const incyUrl = getClckShortUrl(excl.clckUrl);
                 const filePathDisplay = excl.gitFilePath || `subs/${excl.token}.txt`;
                 const isSubscribed = excl.channelMembership !== 'left';
                 const hasDevice = Boolean(excl.boundDevice);
@@ -1335,7 +1345,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                 const directSubUrl = `${window.location.origin}/api/sub/${excl.token}`;
                 const rawUrl = excl.gitRawUrl || directSubUrl;
                 const happUrl = excl.happUrl || '';
-                const incyUrl = (excl.clckUrl && !excl.clckUrl.includes('clck.ru/3W')) ? excl.clckUrl : rawUrl;
+                const incyUrl = getClckShortUrl(excl.clckUrl);
                 const filePathDisplay = excl.gitFilePath || `subs/${excl.token}.txt`;
                 const customLines = (excl.customContent || (excl.customNodes && excl.customNodes.join('\n')) || '').trim();
                 const customKeysCount = customLines ? customLines.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length : 0;
@@ -1665,7 +1675,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                 const timeInfo = formatRemainingTime(excl.expiresAt);
                 const directSubUrl = `${window.location.origin}/api/sub/${excl.token}`;
                 const rawUrl = excl.gitRawUrl || directSubUrl;
-                const incyUrl = (excl.clckUrl && !excl.clckUrl.includes('clck.ru/3W')) ? excl.clckUrl : rawUrl;
+                const incyUrl = getClckShortUrl(excl.clckUrl);
                 const happUrl = excl.happUrl || '';
                 const customLines = (excl.customContent || (excl.customNodes && excl.customNodes.join('\n')) || '').trim();
                 const customKeysCount = customLines ? customLines.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length : 0;

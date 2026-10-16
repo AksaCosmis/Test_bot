@@ -11,7 +11,8 @@ export interface TelegramBotManagerOptions {
   getBots: () => any[];
   getStore: () => any;
   saveStore: () => void;
-  ensureUserRepoFile: (user: any, format: 'happ' | 'incy') => Promise<{ filePath: string; rawUrl: string; finalUrl: string }>;
+  ensureUserRepoFile: (user: any, format: 'happ' | 'incy', forceNewFile?: boolean) => Promise<{ filePath: string; rawUrl: string; finalUrl: string }>;
+  deleteUserRepoFile: (sourceId: string, filePath: string) => Promise<boolean>;
   resolveUserDisplayKey: (user: any) => Promise<string>;
   applyDisconnectStub: (user: any, reason: string, sourceNum?: 1 | 2 | 3) => Promise<void>;
   restoreUserNodes: (user: any) => Promise<void>;
@@ -1061,6 +1062,38 @@ export class TelegramBotManager {
       return;
     }
 
+    if (data === 'cmd_report_broken_subscription') {
+      user.pendingSubscriptionReissue = true;
+      store.feedbackRequests = store.feedbackRequests || [];
+      store.feedbackRequests.unshift({
+        id: `feedback_${Date.now()}_${user.telegramId}`,
+        userId: user.id,
+        telegramId: user.telegramId,
+        username: user.username,
+        firstName: user.firstName,
+        type: 'general_feedback',
+        message: 'Пользователь сообщил, что подписка не работает, и запросил перевыпуск.',
+        createdAt: new Date().toISOString(),
+        status: 'pending',
+      });
+      this.options.saveStore();
+      await this.tgApi(bot.token, 'sendMessage', {
+        chat_id: chatId,
+        text: '🛠 <b>Перевыпуск подписки</b>\n\nВыберите формат новой подписки. Она будет создана в текущем источнике, а предыдущий файл будет удалён, если источник доступен.',
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🚀 HAPP (crypt4)', callback_data: 'cmd_issue_happ' },
+              { text: '⚡ INCY', callback_data: 'cmd_issue_incy' },
+            ],
+            [{ text: 'Отмена', callback_data: 'cmd_menu' }],
+          ],
+        },
+      });
+      return;
+    }
+
     // 2. If blocked, only permit verify channel, unbind request, profile, or second device removal; otherwise send blocked message
     const isPermittedBlockedAction = [
       'cmd_verify_channel',
@@ -1204,6 +1237,10 @@ export class TelegramBotManager {
 
     // Main menu
     if (data === 'cmd_menu' || data === 'cmd_start') {
+      if (user.pendingSubscriptionReissue) {
+        user.pendingSubscriptionReissue = false;
+        this.options.saveStore();
+      }
       await this.sendMainMenu(bot, chatId, user);
       return;
     }
@@ -1271,6 +1308,14 @@ export class TelegramBotManager {
 
       const isHapp = data === 'cmd_issue_happ';
       const format: 'happ' | 'incy' = isHapp ? 'happ' : 'incy';
+      const isReissue = user.pendingSubscriptionReissue === true;
+      const previousSubscription = isReissue
+        ? user.sourceSubscriptions?.find((item: any) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath) ||
+          user.sourceSubscriptions?.find((item: any) => item.sourceId === user.subscriptionSourceId) ||
+          (user.gitFilePath && user.subscriptionSourceId
+            ? { sourceId: user.subscriptionSourceId, filePath: user.gitFilePath }
+            : undefined)
+        : undefined;
 
       // Send a temporary "loading subscription" notification (no mention of repository)
       const loadingMsg = await this.tgApi(bot.token, 'sendMessage', {
@@ -1281,8 +1326,39 @@ export class TelegramBotManager {
 
       try {
         // Physical allocation / creation of subscription
-        const subResult = await this.options.ensureUserRepoFile(user, format);
-        const subTypeName = isHapp ? 'HAPP (crypt5)' : 'INCY';
+        const subResult = await this.options.ensureUserRepoFile(user, format, isReissue);
+        let previousFileCleanupFailed = false;
+        if (isReissue && previousSubscription && previousSubscription.filePath !== subResult.filePath) {
+          let deleted = false;
+          try {
+            deleted = await this.options.deleteUserRepoFile(previousSubscription.sourceId, previousSubscription.filePath);
+          } catch (cleanupError: any) {
+            console.warn(`[Subscription reissue] Failed to delete previous file for ${user.telegramId}:`, cleanupError.message);
+          }
+          if (deleted) {
+            user.sourceSubscriptions = (user.sourceSubscriptions || []).filter(
+              (item: any) => item.sourceId !== previousSubscription.sourceId || item.filePath !== previousSubscription.filePath
+            );
+            store.repoFiles = (store.repoFiles || []).filter(
+              (item: any) => item.sourceId !== previousSubscription.sourceId || item.filePath !== previousSubscription.filePath
+            );
+          } else {
+            previousFileCleanupFailed = true;
+          }
+        }
+        user.pendingSubscriptionReissue = false;
+        if (isReissue && !previousFileCleanupFailed) {
+          const feedback = store.feedbackRequests?.find((request: any) =>
+            request.telegramId === user.telegramId &&
+            request.status === 'pending' &&
+            request.message === 'Пользователь сообщил, что подписка не работает, и запросил перевыпуск.'
+          );
+          if (feedback) {
+            feedback.status = 'resolved';
+            feedback.resolvedAt = new Date().toISOString();
+          }
+        }
+        const subTypeName = isHapp ? 'HAPP (crypt4)' : 'INCY';
         const totalServers = 'содержимое центрального источника без преобразований';
         const hours = bot.selfDeleteHours || 72;
 
@@ -1329,7 +1405,7 @@ export class TelegramBotManager {
           name: user.firstName || 'друг',
           subTypeName,
           format: subTypeName,
-          otherFormat: isHapp ? 'INCY' : 'HAPP (crypt5)',
+          otherFormat: isHapp ? 'INCY' : 'HAPP (crypt4)',
           totalServers,
           time: issuedTime,
           tz: issuedTz,
@@ -1339,16 +1415,19 @@ export class TelegramBotManager {
           qrNotice: '📱 Скопируйте ключ выше для подключения в приложении:',
         });
         const successHtml = markdownToTelegramHtml(formattedSuccess);
+        const cleanupWarning = previousFileCleanupFailed
+          ? '\n\n⚠️ Новая подписка создана, но удалить предыдущий файл из старого Git-источника не удалось. Обратитесь к администратору для очистки.'
+          : '';
 
         await this.tgApi(bot.token, 'sendMessage', {
           chat_id: chatId,
-          text: successHtml,
+          text: `${successHtml}${cleanupWarning}`,
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
               [
                 {
-                  text: isHapp ? '⚡ Переключить на INCY' : '🚀 Переключить на HAPP (crypt5)',
+                  text: isHapp ? '⚡ Переключить на INCY' : '🚀 Переключить на HAPP (crypt4)',
                   callback_data: isHapp ? 'cmd_issue_incy' : 'cmd_issue_happ',
                 },
                 { text: '📋 Инструкция', callback_data: 'cmd_instructions' },
@@ -1357,11 +1436,16 @@ export class TelegramBotManager {
                 { text: '👤 Мой профиль', callback_data: 'cmd_profile' },
                 { text: '📝 Сменить устройство', callback_data: 'cmd_request_unbind' },
               ],
+              [{ text: '🌐 Получить подписку из текущего источника', callback_data: 'cmd_choose_format' }],
               [{ text: '◀️ Главное меню', callback_data: 'cmd_menu' }],
             ],
           },
         });
       } catch (err: any) {
+        if (isReissue) {
+          user.pendingSubscriptionReissue = false;
+          this.options.saveStore();
+        }
         console.error('[Telegram Bot] Failed to create subscription:', err);
         await this.tgApi(bot.token, 'sendMessage', {
           chat_id: chatId,
@@ -1382,8 +1466,10 @@ export class TelegramBotManager {
     if (data === 'cmd_profile') {
       const isSubActive = Boolean(user.hasActiveSubscription);
       const isHapp = user.subscriptionType === 'happ';
+      const activeGitSource = store.gitSources?.find((source: any) => source.id === store.activeGitSourceId) || store.gitSources?.[0];
       let displayKey = '';
       const canRefreshRepositoryFile = isSubActive &&
+        (!user.subscriptionSourceId || user.subscriptionSourceId === activeGitSource?.id) &&
         user.status === 'active' &&
         user.channelMembership !== 'left' &&
         !user.isBlocked &&
@@ -1416,7 +1502,7 @@ export class TelegramBotManager {
 
       const boundDate = user.boundDevice ? new Date(user.boundDevice.boundAt).toLocaleString('ru-RU') : 'Не привязано (свободный слот)';
       const deviceName = user.boundDevice?.clientName || 'Ожидает первого подключения';
-      const formatName = isHapp ? 'HAPP (crypt5)' : 'INCY';
+      const formatName = isHapp ? 'HAPP (crypt4)' : 'INCY';
       let statusText = isSubActive ? '🟢 Активна' : '⚪ Не получена';
       if (user.isBlocked || user.status === 'blocked') {
         statusText = `⛔ Заблокирована (Предупреждение [${user.sharingWarningCount || 1}])`;
@@ -1430,7 +1516,7 @@ export class TelegramBotManager {
         telegramId: user.telegramId,
         format: formatName,
         subTypeName: formatName,
-        otherFormat: isHapp ? 'INCY' : 'HAPP (crypt5)',
+        otherFormat: isHapp ? 'INCY' : 'HAPP (crypt4)',
         status: statusText,
         device: deviceName,
         boundDate,
@@ -1462,7 +1548,7 @@ export class TelegramBotManager {
             ...actionButtons,
             [
               {
-                text: isHapp ? '⚡ Переключить на INCY' : '🚀 Переключить на HAPP (crypt5)',
+                text: isHapp ? '⚡ Переключить на INCY' : '🚀 Переключить на HAPP (crypt4)',
                 callback_data: isHapp ? 'cmd_issue_incy' : 'cmd_issue_happ',
               },
               { text: '📋 Инструкция', callback_data: 'cmd_instructions' },
@@ -1471,6 +1557,7 @@ export class TelegramBotManager {
               { text: '📝 Запросить смену устройства', callback_data: 'cmd_request_unbind' },
               { text: '💬 Поддержка', url: bot.adminContactUrl || 'https://t.me/puls_admin' },
             ],
+            [{ text: '🛠 Подписка не работает — перевыпустить', callback_data: 'cmd_report_broken_subscription' }],
             [{ text: '◀️ Главное меню', callback_data: 'cmd_menu' }],
           ]
         : [
@@ -1564,7 +1651,12 @@ export class TelegramBotManager {
   private async sendFormatSelection(bot: any, chatId: number | string) {
     const chooseTemplate = bot.chooseFormatMessage || CANONICAL_BOT_TEMPLATES.chooseFormatMessage;
     const formattedMarkdown = formatBotTemplate(chooseTemplate, {});
-    const htmlText = markdownToTelegramHtml(formattedMarkdown);
+    const store = this.options.getStore();
+    const activeSource = store.gitSources?.find((source: any) => source.id === store.activeGitSourceId) || store.gitSources?.[0];
+    const sourceNotice = activeSource
+      ? `\n\n📡 Новая подписка будет создана в текущем источнике: <b>${escapeHtml(activeSource.name)}</b>.`
+      : '';
+    const htmlText = `${markdownToTelegramHtml(formattedMarkdown)}${sourceNotice}`;
 
     await this.tgApi(bot.token, 'sendMessage', {
       chat_id: chatId,
@@ -1573,7 +1665,7 @@ export class TelegramBotManager {
       reply_markup: {
         inline_keyboard: [
           [
-            { text: '🚀 Выбрать HAPP (crypt5)', callback_data: 'cmd_issue_happ' },
+            { text: '🚀 Выбрать HAPP (crypt4)', callback_data: 'cmd_issue_happ' },
             { text: '⚡ Выбрать INCY', callback_data: 'cmd_issue_incy' },
           ],
           [
@@ -1589,7 +1681,13 @@ export class TelegramBotManager {
   private async sendMainMenu(bot: any, chatId: number | string, user: any) {
     const isSubActive = Boolean(user.hasActiveSubscription && user.finalSubscriptionUrl);
     const isHapp = user.subscriptionType === 'happ';
-    const formatName = isHapp ? 'HAPP (crypt5)' : 'INCY';
+    const formatName = isHapp ? 'HAPP (crypt4)' : 'INCY';
+    const store = this.options.getStore();
+    const activeSource = store.gitSources?.find((source: any) => source.id === store.activeGitSourceId) || store.gitSources?.[0];
+    const sourceChanged = Boolean(user.subscriptionSourceId && activeSource && user.subscriptionSourceId !== activeSource.id);
+    const sourceChangeNotice = sourceChanged
+      ? `\n\n⚠️ <b>Источник подписки изменился</b> на «${escapeHtml(activeSource.name)}». Получите актуальную подписку через кнопку ниже.`
+      : '';
     const welcomeTemplate = bot.welcomeMessage || CANONICAL_BOT_TEMPLATES.welcomeMessage;
     const welcomeFormatted = formatBotTemplate(welcomeTemplate, {
       name: user.firstName || 'друг',
@@ -1644,7 +1742,7 @@ export class TelegramBotManager {
         `🔑 <b>У вас активна персональная подписка!</b>\n` +
         `🏷 Формат: <b>${formatName}</b>\n` +
         `📱 Доступ: 1 персональное устройство\n\n` +
-        `Управляйте вашей подпиской через меню ниже:`;
+        `Управляйте вашей подпиской через меню ниже:${sourceChangeNotice}`;
 
       await this.tgApi(bot.token, 'sendMessage', {
         chat_id: chatId,
@@ -1654,15 +1752,17 @@ export class TelegramBotManager {
           inline_keyboard: [
             [
               {
-                text: isHapp ? '⚡ Переключить на INCY' : '🚀 Переключить на HAPP (crypt5)',
+                text: isHapp ? '⚡ Переключить на INCY' : '🚀 Переключить на HAPP (crypt4)',
                 callback_data: isHapp ? 'cmd_issue_incy' : 'cmd_issue_happ',
               },
               { text: '👤 Мой профиль', callback_data: 'cmd_profile' },
             ],
+            [{ text: '🛠 Подписка не работает — перевыпустить', callback_data: 'cmd_report_broken_subscription' }],
             [
               { text: '📋 Инструкция', callback_data: 'cmd_instructions' },
               { text: '📝 Сменить устройство', callback_data: 'cmd_request_unbind' },
             ],
+            [{ text: '🌐 Получить подписку из текущего источника', callback_data: 'cmd_choose_format' }],
             [{ text: '💬 Поддержка', url: bot.adminContactUrl || 'https://t.me/puls_admin' }],
           ],
         },

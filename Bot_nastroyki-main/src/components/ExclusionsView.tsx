@@ -412,9 +412,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
     const directSubUrl = `${window.location.origin}/api/sub/${qrModalExcl.token}`;
     const rawUrl = qrModalExcl.gitRawUrl || directSubUrl;
     const incyUrl = (qrModalExcl.clckUrl && !qrModalExcl.clckUrl.includes('clck.ru/3W')) ? qrModalExcl.clckUrl : rawUrl;
-    const happUrl = (qrModalExcl.happUrl && qrModalExcl.happUrl.startsWith('happ://crypt5/'))
-      ? qrModalExcl.happUrl
-      : `happ://crypt5/${btoa(unescape(encodeURIComponent(rawUrl)))}=ff`;
+    const happUrl = qrModalExcl.happUrl || '';
     const targetUrl = qrFormat === 'happ' ? happUrl : incyUrl;
 
     QRCode.toDataURL(targetUrl, {
@@ -897,9 +895,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
               channelExclusions.map((excl) => {
                 const directSubUrl = `${window.location.origin}/api/sub/${excl.token}`;
                 const rawUrl = excl.gitRawUrl || directSubUrl;
-                const happUrl = (excl.happUrl && excl.happUrl.startsWith('happ://crypt5/'))
-                  ? excl.happUrl
-                  : `happ://crypt5/${btoa(unescape(encodeURIComponent(rawUrl)))}=ff`;
+                const happUrl = excl.happUrl || '';
                 const incyUrl = (excl.clckUrl && !excl.clckUrl.includes('clck.ru/3W')) ? excl.clckUrl : rawUrl;
                 const filePathDisplay = excl.gitFilePath || `subs/${excl.token}.txt`;
                 const isSubscribed = excl.channelMembership !== 'left';
@@ -1134,7 +1130,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                           <div className="flex items-center justify-between text-[11px] font-bold text-purple-950 mb-1">
                             <span className="flex items-center space-x-1">
                               <Sparkles className="h-3.5 w-3.5 text-purple-600" />
-                              <span>HAPP (crypt5) - 1 устр.:</span>
+                              <span>HAPP (crypt4) - 1 устр.:</span>
                             </span>
                             <div className="flex items-center space-x-1">
                               <button
@@ -1338,9 +1334,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
               teamExclusions.map((excl) => {
                 const directSubUrl = `${window.location.origin}/api/sub/${excl.token}`;
                 const rawUrl = excl.gitRawUrl || directSubUrl;
-                const happUrl = (excl.happUrl && excl.happUrl.startsWith('happ://crypt5/'))
-                  ? excl.happUrl
-                  : `happ://crypt5/${btoa(unescape(encodeURIComponent(rawUrl)))}=ff`;
+                const happUrl = excl.happUrl || '';
                 const incyUrl = (excl.clckUrl && !excl.clckUrl.includes('clck.ru/3W')) ? excl.clckUrl : rawUrl;
                 const filePathDisplay = excl.gitFilePath || `subs/${excl.token}.txt`;
                 const customLines = (excl.customContent || (excl.customNodes && excl.customNodes.join('\n')) || '').trim();
@@ -1407,12 +1401,12 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
 
                       {/* Links Box */}
                       <div className="mt-3.5 space-y-2.5">
-                        {/* Happ Link (crypt5) */}
+                        {/* Happ Link (crypt4) */}
                         <div className="p-2.5 rounded-xl bg-amber-50/70 border border-amber-200/90">
                           <div className="flex items-center justify-between text-[11px] font-bold text-amber-900 mb-1">
                             <span className="flex items-center space-x-1.5">
                               <Sparkles className="h-3.5 w-3.5 text-amber-600" />
-                              <span>Формат HAPP (crypt5):</span>
+                              <span>Формат HAPP (crypt4):</span>
                             </span>
                             <div className="flex items-center space-x-1.5">
                               <button
@@ -1672,9 +1666,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                 const directSubUrl = `${window.location.origin}/api/sub/${excl.token}`;
                 const rawUrl = excl.gitRawUrl || directSubUrl;
                 const incyUrl = (excl.clckUrl && !excl.clckUrl.includes('clck.ru/3W')) ? excl.clckUrl : rawUrl;
-                const happUrl = (excl.happUrl && excl.happUrl.startsWith('happ://crypt5/'))
-                  ? excl.happUrl
-                  : `happ://crypt5/${btoa(unescape(encodeURIComponent(rawUrl)))}=ff`;
+                const happUrl = excl.happUrl || '';
                 const customLines = (excl.customContent || (excl.customNodes && excl.customNodes.join('\n')) || '').trim();
                 const customKeysCount = customLines ? customLines.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length : 0;
 
@@ -1758,7 +1750,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
 
                       {/* Links preview and copy */}
                       <div className="mt-3 space-y-2">
-                        {/* HAPP crypt5 */}
+                        {/* HAPP crypt4 */}
                         <div className="flex items-center justify-between bg-stone-50 rounded-xl p-2 border border-stone-200">
                           <div className="flex items-center space-x-2 min-w-0 mr-2">
                             <span className="px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded font-bold text-[10px] uppercase shrink-0">HAPP</span>
@@ -1768,7 +1760,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                             type="button"
                             onClick={() => handleCopy(happUrl, `temp_happ_${excl.id}`)}
                             className="p-1 hover:bg-stone-200 rounded-lg text-stone-600 shrink-0 cursor-pointer"
-                            title="Скопировать ссылку для HAPP (crypt5)"
+                            title="Скопировать ссылку для HAPP (crypt4)"
                           >
                             {copiedKey === `temp_happ_${excl.id}` ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
                           </button>
@@ -1989,7 +1981,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                     onChange={(e) => setChannelFormat(e.target.value as any)}
                     className="w-full px-3 py-2 rounded-xl border border-stone-200 bg-stone-50 text-stone-900 focus:bg-white focus:outline-none focus:ring-1 focus:ring-purple-500 font-semibold"
                   >
-                    <option value="happ">🚀 HAPP (crypt5) зашифрованная</option>
+                    <option value="happ">🚀 HAPP (crypt4) зашифрованная</option>
                     <option value="incy">⚡ INCY (VLESS / clck.ru)</option>
                   </select>
                 </div>
@@ -2247,7 +2239,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                   qrFormat === 'happ' ? 'bg-white text-stone-900 shadow-xs' : 'text-stone-500 hover:text-stone-900'
                 }`}
               >
-                HAPP (crypt5)
+                HAPP (crypt4)
               </button>
               <button
                 type="button"
@@ -2409,7 +2401,7 @@ export const ExclusionsView: React.FC<ExclusionsViewProps> = ({
                     className="w-full px-2.5 py-1.5 rounded-lg border border-stone-200 bg-white text-xs focus:outline-none focus:ring-1 focus:ring-sky-500"
                   >
                     <option value="INCY">⚡ INCY (VLESS / Shadowrocket)</option>
-                    <option value="HAPP">🚀 HAPP (crypt5)</option>
+                    <option value="HAPP">🚀 HAPP (crypt4)</option>
                     <option value="V2Ray">🛡️ V2Ray / v2rayNG</option>
                     <option value="Clash">📦 Clash / Mihomo</option>
                     <option value="Sing-Box">📦 Sing-Box / SFA</option>

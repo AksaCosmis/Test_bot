@@ -178,6 +178,7 @@ export interface CentralSubscriptionSavePayload {
 
 export interface RepoUserFile {
   id?: string;
+  sourceId?: string;
   userId?: string | null;
   telegramId?: number | null;
   username?: string | null;
@@ -207,7 +208,7 @@ export interface BotUser {
   lastName?: string;
   joinedAt: string;
   receivedAt: string | null; // exact timestamp when subscription was claimed
-  subscriptionName: string; // e.g. "HAPP (crypt5) - VLESS VIP"
+  subscriptionName: string; // e.g. "HAPP (crypt4) - VLESS VIP"
   subscriptionType: SubscriptionType;
   status: UserSubStatus;
   mutedUntil: string | null; // ISO timestamp if muted
@@ -227,6 +228,16 @@ export interface BotUser {
   lastActiveAt: string;
   personalNodes: string[]; // custom nodes injected only for this user
   isException?: boolean;
+  subscriptionSourceId?: string;
+  sourceSubscriptions?: Array<{
+    sourceId: string;
+    filePath: string;
+    rawUrl: string;
+    format: 'happ' | 'incy';
+    finalUrl: string;
+    updatedAt: string;
+  }>;
+  pendingSubscriptionReissue?: boolean;
   gitFilePath?: string;
   gitRawUrl?: string;
   finalSubscriptionUrl?: string;

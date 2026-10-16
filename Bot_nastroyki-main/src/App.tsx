@@ -506,6 +506,7 @@ export default function App() {
         {currentTab === 'users' && (
           <UsersChannelView
             users={users}
+            gitSources={gitSources}
             status={status}
             centralContent={centralFile?.content}
             onSyncChannel={loadAllData}
@@ -623,7 +624,7 @@ export default function App() {
           <div className="flex items-center space-x-3">
             <span>GitVerse • GitFlic • MosHub • GitHub • GitLab</span>
             <span>•</span>
-            <span>HAPP (crypt5) • INCY (qsen.ru)</span>
+            <span>HAPP (crypt4) • INCY (qsen.ru)</span>
             <span>•</span>
             <span className="text-emerald-600 font-medium">Система активна</span>
           </div>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Layers, 
   Save, 
@@ -111,6 +111,7 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
   };
 
   const [content, setContent] = useState<string>(centralFile?.content || '');
+  const importFileInputRef = useRef<HTMLInputElement>(null);
   const [isContentDirty, setIsContentDirty] = useState(false);
   const [autoSync, setAutoSync] = useState<boolean>(centralFile?.autoSyncEnabled ?? true);
   const [autoSyncInterval, setAutoSyncInterval] = useState<number>(centralFile?.autoSyncIntervalSeconds || 1);
@@ -697,6 +698,33 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleImportContentFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const importedContent = await file.text();
+      setContent(importedContent);
+      setIsContentDirty(true);
+      setStatusMessage({
+        type: 'success',
+        text: `Файл «${file.name}» загружен в редактор. Нажмите «Сохранить» или «Запушить в Git», чтобы применить изменения.`,
+      });
+    } catch (err: any) {
+      setStatusMessage({ type: 'error', text: `Не удалось прочитать файл: ${err.message || 'ошибка чтения'}` });
+    }
+  };
+
+  const handleExportContentFile = () => {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const downloadUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = downloadUrl;
+    anchor.download = filename || 'subscription.txt';
+    anchor.click();
+    URL.revokeObjectURL(downloadUrl);
+  };
+
   const handleAddNodeSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     let nodeUri = '';
@@ -756,10 +784,10 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
                   ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
                   : 'border-stone-200 hover:bg-stone-50 text-stone-700'
               }`}
-              title="Загрузить изменения из репозитория GitVerse"
+              title={`Загрузить файл центральной подписки из активного источника ${gitSource?.name || 'Git'}`}
             >
               <ArrowDownToLine className={`h-3.5 w-3.5 ${isSyncing === 'pull' ? 'animate-bounce' : ''}`} />
-              <span>Подтянуть из Git</span>
+              <span>Импорт из источника</span>
               {lastGitPullResult && (
                 <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${lastGitPullResult.success ? 'bg-emerald-200 text-emerald-900' : 'bg-rose-200 text-rose-900'}`}>
                   {lastGitPullResult.success ? 'OK' : 'ERR'}
@@ -778,10 +806,10 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
                   ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
                   : 'border-stone-200 hover:bg-stone-50 text-stone-700'
               }`}
-              title="Закоммитить и отправить в Git-репозиторий GitVerse"
+              title={`Заменить центральный файл в активном источнике ${gitSource?.name || 'Git'} и синхронизировать подписки`}
             >
               <ArrowUpFromLine className={`h-3.5 w-3.5 ${isSyncing === 'push' ? 'animate-bounce' : ''}`} />
-              <span>Запушить в Git</span>
+              <span>Экспорт в источник</span>
               {lastGitPushResult && (
                 <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${lastGitPushResult.success ? 'bg-emerald-200 text-emerald-900' : 'bg-rose-200 text-rose-900'}`}>
                   {lastGitPushResult.success ? 'OK' : 'ERR'}
@@ -1262,6 +1290,33 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={importFileInputRef}
+              type="file"
+              accept=".txt,.json,text/plain,application/json"
+              onChange={handleImportContentFile}
+              className="hidden"
+            />
+            <button
+              type="button"
+              id="btn-import-central-content"
+              onClick={() => importFileInputRef.current?.click()}
+              className="text-xs px-2.5 py-1 rounded-lg bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 font-medium transition-colors flex items-center gap-1 shadow-xs"
+              title="Заменить содержимое редактора текстом из локального файла; отправка в репозиторий выполняется отдельно"
+            >
+              <ArrowDownToLine className="h-3 w-3" />
+              <span>Импорт в редактор</span>
+            </button>
+            <button
+              type="button"
+              id="btn-export-central-content"
+              onClick={handleExportContentFile}
+              className="text-xs px-2.5 py-1 rounded-lg bg-violet-50 hover:bg-violet-100 text-violet-800 border border-violet-200 font-medium transition-colors flex items-center gap-1 shadow-xs"
+              title="Скачать текущее содержимое редактора в текстовый файл"
+            >
+              <ArrowUpFromLine className="h-3 w-3" />
+              <span>Экспорт файла</span>
+            </button>
             <button
               type="button"
               id="btn-insert-section-divider"

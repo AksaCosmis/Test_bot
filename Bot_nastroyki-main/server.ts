@@ -2351,15 +2351,22 @@ async function deleteFileViaGitCli(params: {
     await execFileAsync('git', ['checkout', branchName], { cwd: repoDir, timeout: 5000, env: gitEnv });
     await execFileAsync('git', ['reset', '--hard', `origin/${branchName}`], { cwd: repoDir, timeout: 5000, env: gitEnv });
 
-    const fullTargetFilePath = path.join(repoDir, cleanPath);
-    await fs.promises.unlink(fullTargetFilePath).catch(() => {});
-    await execFileAsync('git', ['rm', '-f', cleanPath], { cwd: repoDir, timeout: 10000 }).catch(() => {});
+    const trackedFile = await execFileAsync('git', ['ls-files', '--error-unmatch', '--', cleanPath], {
+      cwd: repoDir,
+      timeout: 5000,
+    }).then(() => true).catch(() => false);
+    if (!trackedFile) return true;
+
+    await execFileAsync('git', ['rm', '-f', '--', cleanPath], { cwd: repoDir, timeout: 10000 });
     const status = await execFileAsync('git', ['status', '--porcelain'], { cwd: repoDir, timeout: 5000 });
     if (!status.stdout.trim()) return true;
-    await execFileAsync('git', ['commit', '-m', commitMessage || `Delete ${cleanPath}`], { cwd: repoDir, timeout: 10000 }).catch(() => {});
+    await execFileAsync('git', ['config', 'user.name', 'Puls Access'], { cwd: repoDir, timeout: 5000 });
+    await execFileAsync('git', ['config', 'user.email', 'puls-access@users.noreply.github.com'], { cwd: repoDir, timeout: 5000 });
+    await execFileAsync('git', ['commit', '-m', commitMessage || `Delete ${cleanPath}`], { cwd: repoDir, timeout: 10000 });
     await execFileAsync('git', ['push', 'origin', branchName], { cwd: repoDir, timeout: 25000, env: gitEnv });
     return true;
-  } catch {
+  } catch (err: any) {
+    console.warn(`[Git CLI] Failed to delete ${cleanPath} from ${provider}/${owner}/${repo}:`, err.message);
     return false;
   }
 }
@@ -3140,7 +3147,9 @@ async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
   const linkedExclusions = (store.exclusions || []).filter(
     (item) => item.userId === user.id || item.token === user.subscriptionToken
   );
-  const relatedRepoFiles = (store.repoFiles || []).filter((file) => file.userId === user.id);
+  const relatedRepoFiles = (store.repoFiles || []).filter(
+    (file) => file.userId === user.id || file.telegramId === user.telegramId
+  );
   const filePaths = [
     user.gitFilePath,
     ...linkedExclusions.map((item) => item.gitFilePath),
@@ -3153,7 +3162,9 @@ async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
   }
 
   if (store.repoFiles) {
-    store.repoFiles = store.repoFiles.filter((f) => !filePaths.includes(f.filePath) && f.userId !== user.id);
+    store.repoFiles = store.repoFiles.filter(
+      (f) => !filePaths.includes(f.filePath) && f.userId !== user.id && f.telegramId !== user.telegramId
+    );
   }
   store.exclusions = (store.exclusions || []).filter(
     (item) => item.userId !== user.id && item.token !== user.subscriptionToken
@@ -3174,16 +3185,40 @@ interface CentralSyncResult {
   syncedExclusions: number;
   durationMs: number;
   errors: string[];
+  totalUsers: number;
+  centralNodesCount: number;
+  skippedUsers: {
+    noActiveSubscription: number;
+    inactiveStatus: number;
+    leftChannel: number;
+    blocked: number;
+    muted: number;
+    detachedFromCentral: number;
+    missingFilePath: number;
+  };
   skippedUnchanged?: number;
   pushedCount?: number;
   mode?: 'instant' | 'full';
 }
+
+const emptySkippedUsers = () => ({
+  noActiveSubscription: 0,
+  inactiveStatus: 0,
+  leftChannel: 0,
+  blocked: 0,
+  muted: 0,
+  detachedFromCentral: 0,
+  missingFilePath: 0,
+});
 
 let lastCentralSyncStats: CentralSyncResult = {
   syncedUsers: 0,
   syncedExclusions: 0,
   durationMs: 0,
   errors: [],
+  totalUsers: 0,
+  centralNodesCount: 0,
+  skippedUsers: emptySkippedUsers(),
 };
 
 // High-speed parallel propagation: Instant in-memory sync (<50ms) + Smart delta-checking & throttled Git background worker
@@ -3193,6 +3228,7 @@ async function syncActiveSubscribersWithCentral(options?: {
 }): Promise<CentralSyncResult> {
   const startTime = Date.now();
   const activeGit = getActiveGitSource();
+  const errors: string[] = [];
 
   // If another push worker is active and full sync was requested, await it first to prevent 409 collisions
   if (activePushWorkerPromise && options?.backgroundGitPush === false) {
@@ -3203,7 +3239,16 @@ async function syncActiveSubscribersWithCentral(options?: {
 
   // Auto-allocate gitFilePath for any active subscriber missing a repository file
   for (const u of store.users || []) {
-    if (u.status === 'active' && u.hasActiveSubscription && !u.gitFilePath) {
+    if (
+      u.status === 'active' &&
+      u.hasActiveSubscription &&
+      u.channelMembership !== 'left' &&
+      !u.isBlocked &&
+      !u.isPermanentlyBanned &&
+      !u.isMuted &&
+      !u.detachedFromCentral &&
+      !u.gitFilePath
+    ) {
       try {
         const format = u.subscriptionType === 'happ' ? 'happ' : 'incy';
         const alloc = await ensureUserRepoFile(u, format);
@@ -3212,8 +3257,20 @@ async function syncActiveSubscribersWithCentral(options?: {
         u.finalSubscriptionUrl = alloc.finalUrl;
       } catch (err: any) {
         console.warn(`[Auto-allocate file error for @${u.username || u.telegramId}]:`, err.message);
+        errors.push(`User ${u.telegramId}: не удалось создать файл подписки: ${err.message}`);
       }
     }
+  }
+
+  const skippedUsers = emptySkippedUsers();
+  for (const user of store.users) {
+    if (!user.hasActiveSubscription) skippedUsers.noActiveSubscription++;
+    else if (user.isBlocked || user.isPermanentlyBanned || user.status === 'blocked') skippedUsers.blocked++;
+    else if (user.isMuted || user.status === 'muted') skippedUsers.muted++;
+    else if (user.channelMembership === 'left' || user.status === 'channel_inactive') skippedUsers.leftChannel++;
+    else if (user.detachedFromCentral) skippedUsers.detachedFromCentral++;
+    else if (user.status !== 'active') skippedUsers.inactiveStatus++;
+    else if (!user.gitFilePath) skippedUsers.missingFilePath++;
   }
 
   const eligibleUsers = store.users.filter(
@@ -3224,8 +3281,11 @@ async function syncActiveSubscribersWithCentral(options?: {
       !u.isBlocked &&
       !u.isPermanentlyBanned &&
       !u.isMuted &&
+      !u.detachedFromCentral &&
       u.gitFilePath
   );
+  const totalUsers = store.users.length;
+  const centralNodesCount = parseNodeStats(store.centralFile?.content || '').total;
 
   for (const u of eligibleUsers) {
     u.lastActiveAt = new Date().toISOString();
@@ -3242,7 +3302,6 @@ async function syncActiveSubscribersWithCentral(options?: {
   let syncedExclusions = 0;
   let skippedUnchanged = 0;
   let pushedCount = 0;
-  const errors: string[] = [];
 
   // Group unique file paths to eliminate duplicate concurrent writes to the same repository file
   const uniqueFilesToSync = new Map<
@@ -3515,6 +3574,9 @@ async function syncActiveSubscribersWithCentral(options?: {
           syncedExclusions,
           durationMs: Date.now() - startTime,
           errors,
+          totalUsers,
+          centralNodesCount,
+          skippedUsers,
           skippedUnchanged,
           pushedCount,
           mode: 'instant',
@@ -3524,14 +3586,15 @@ async function syncActiveSubscribersWithCentral(options?: {
       })
       .catch((err) => console.warn('[Background Git Push Error]:', err.message));
 
-    syncedUsers = eligibleUsers.length;
-    syncedExclusions = (store.exclusions || []).length;
     const durationMs = Date.now() - startTime;
     lastCentralSyncStats = {
       syncedUsers,
       syncedExclusions,
       durationMs,
       errors,
+      totalUsers,
+      centralNodesCount,
+      skippedUsers,
       skippedUnchanged,
       pushedCount,
       mode: 'instant',
@@ -3542,14 +3605,15 @@ async function syncActiveSubscribersWithCentral(options?: {
 
   // Otherwise wait for push worker to complete
   await activePushWorkerPromise;
-  syncedUsers = eligibleUsers.length;
-  syncedExclusions = (store.exclusions || []).length;
   const durationMs = Date.now() - startTime;
   lastCentralSyncStats = {
     syncedUsers,
     syncedExclusions,
     durationMs,
     errors,
+    totalUsers,
+    centralNodesCount,
+    skippedUsers,
     skippedUnchanged,
     pushedCount,
     mode: 'full',
@@ -5605,7 +5669,10 @@ app.post('/api/users/bulk-action', async (req, res) => {
     const relatedExclusions = (store.exclusions || []).filter(
       (e) => (e.userId !== undefined && idsToDelete.has(e.userId)) || selectedTokens.has(e.token)
     );
-    const relatedRepoFiles = (store.repoFiles || []).filter((file) => idsToDelete.has(file.userId || ''));
+    const selectedTelegramIds = new Set(selectedUsers.map((user) => user.telegramId));
+    const relatedRepoFiles = (store.repoFiles || []).filter(
+      (file) => idsToDelete.has(file.userId || '') || (file.telegramId != null && selectedTelegramIds.has(file.telegramId))
+    );
     const pathsToDelete = [
       ...selectedUsers.map((u) => u.gitFilePath),
       ...relatedExclusions.map((e) => e.gitFilePath),
@@ -5614,12 +5681,16 @@ app.post('/api/users/bulk-action', async (req, res) => {
 
     const deleted = await deleteActiveRepoFiles(pathsToDelete, (filePath) => `Delete user subscription ${filePath}`);
     if (!deleted) {
-      return res.status(502).json({ success: false, message: 'Не удалось удалить файлы подписок из активного Git-репозитория. Пользователи оставлены в списке.' });
+      return res.status(502).json({ success: false, message: `Не удалось удалить файлы подписок из активного Git-источника «${getActiveGitSource().name}». Пользователи оставлены в списке; проверьте токен, ветку и журнал ошибок.` });
     }
 
     // Clean up repoFiles
     if (store.repoFiles) {
-      store.repoFiles = store.repoFiles.filter((f) => !pathsToDelete.includes(f.filePath));
+      store.repoFiles = store.repoFiles.filter(
+        (file) => !pathsToDelete.includes(file.filePath) &&
+          !idsToDelete.has(file.userId || '') &&
+          (file.telegramId == null || !selectedTelegramIds.has(file.telegramId))
+      );
     }
     store.exclusions = (store.exclusions || []).filter(
       (e) => !((e.userId !== undefined && idsToDelete.has(e.userId)) || selectedTokens.has(e.token))
@@ -7035,7 +7106,7 @@ app.delete('/api/users/:id', async (req, res) => {
   if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
   const deleted = await permanentlyDeleteUser(user);
   if (!deleted) {
-    return res.status(502).json({ success: false, message: 'Не удалось удалить подписку из активного Git-репозитория. Пользователь оставлен в списке.' });
+    return res.status(502).json({ success: false, message: `Не удалось удалить подписку из активного Git-источника «${getActiveGitSource().name}». Пользователь оставлен в списке; проверьте токен, ветку и журнал ошибок.` });
   }
   res.json({ success: true });
 });
@@ -8510,9 +8581,23 @@ app.post('/api/central-file/sync-subscribers', async (req, res) => {
       forceFullGitPush: isForce,
     });
     const stats = parseNodeStats(store.centralFile.content);
+    const skippedLabels: Record<keyof CentralSyncResult['skippedUsers'], string> = {
+      noActiveSubscription: 'без активной подписки',
+      inactiveStatus: 'статус не активен',
+      leftChannel: 'вышли из канала',
+      blocked: 'заблокированы',
+      muted: 'заглушены',
+      detachedFromCentral: 'отвязаны от центрального источника',
+      missingFilePath: 'без файла подписки',
+    };
+    const skippedSummary = Object.entries(result.skippedUsers)
+      .filter(([, count]) => count > 0)
+      .map(([reason, count]) => `${skippedLabels[reason as keyof CentralSyncResult['skippedUsers']]}: ${count}`)
+      .join(', ');
+    const eligibleUsers = result.totalUsers - Object.values(result.skippedUsers).reduce((sum, count) => sum + count, 0);
     res.json({
-      success: true,
-      message: `Синхронизация выполнена! Перенесено в ${result.syncedUsers} активных файлов подписок пользователей и ${result.syncedExclusions} исключений (за ${result.durationMs} мс). Заглушенные, заблокированные и отписавшиеся пользователи сохранены в изоляции.`,
+      success: result.errors.length === 0,
+      message: `Центральных узлов: ${result.centralNodesCount}. Обновлено подписок: ${result.syncedUsers} из ${eligibleUsers} активных пользователей (${result.totalUsers} всего). Git-файлов записано: ${result.pushedCount || 0}, без изменений: ${result.skippedUnchanged || 0}, ошибок: ${result.errors.length}.${skippedSummary ? ` Пропущено (${skippedSummary}).` : ''}`,
       syncResult: result,
       stats,
     });

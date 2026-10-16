@@ -109,6 +109,7 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
   const [isSyncing, setIsSyncing] = useState(false);
   const [isSyncingChannelSubscribers, setIsSyncingChannelSubscribers] = useState(false);
   const [isSyncingCentralSubs, setIsSyncingCentralSubs] = useState(false);
+  const [deletingUserId, setDeletingUserId] = useState<string | null>(null);
   const [channelSyncResultAlert, setChannelSyncResultAlert] = useState<{
     type: 'success' | 'warning' | 'error';
     text: string;
@@ -543,6 +544,17 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
       return { isInconsistent: true, reason: u.inconsistencyReason || 'Несовпадение параметров с центральным источником' };
     }
     return { isInconsistent: false };
+  };
+
+  const handleDeleteUser = async (user: BotUser) => {
+    setDeletingUserId(user.id);
+    try {
+      await onDeleteUser(user.id);
+    } catch (err: any) {
+      alert(err.message || `Не удалось удалить подписку пользователя ${user.telegramId}`);
+    } finally {
+      setDeletingUserId(null);
+    }
   };
 
   const handleForceResync = async (user: BotUser) => {
@@ -1503,15 +1515,18 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
 
                       {/* Delete */}
                       <button
+                        disabled={deletingUserId === u.id}
                         onClick={() => {
                           if (confirm(`Удалить пользователя ${u.firstName}?`)) {
-                            onDeleteUser(u.id);
+                            void handleDeleteUser(u);
                           }
                         }}
-                        className="p-1.5 rounded-lg border border-stone-200 hover:bg-rose-50 hover:text-rose-600 text-stone-400"
+                        className="p-1.5 rounded-lg border border-stone-200 hover:bg-rose-50 hover:text-rose-600 text-stone-400 disabled:opacity-50"
                         title="Удалить"
                       >
-                        <Trash2 className="h-3.5 w-3.5" />
+                        {deletingUserId === u.id
+                          ? <RefreshCw className="h-3.5 w-3.5 text-rose-500 animate-spin" />
+                          : <Trash2 className="h-3.5 w-3.5" />}
                       </button>
                     </td>
                   </tr>

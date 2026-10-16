@@ -568,7 +568,7 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
         setLastSubscribersErrors(errors);
         setStatusMessage({
           type: 'error',
-          text: `Синхронизация завершена с ошибками: ${errors.length} файлов не удалось обновить в GitVerse!`,
+          text: `${res.message || 'Синхронизация завершена с ошибками.'} Не удалось обработать файлов: ${errors.length}.`,
         });
       } else {
         setStatusMessage({

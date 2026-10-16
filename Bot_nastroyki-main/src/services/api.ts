@@ -381,8 +381,9 @@ export async function bindUserDevice(id: string, clientName?: string): Promise<{
 
 export async function deleteUser(id: string): Promise<{ success: boolean }> {
   const res = await fetch(`${API_BASE}/users/${id}`, { method: 'DELETE' });
-  if (!res.ok) throw new Error('Ошибка удаления пользователя');
-  return res.json();
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message || 'Ошибка удаления пользователя');
+  return data;
 }
 
 // Broadcasting
@@ -444,12 +445,23 @@ export async function syncCentralToSubscribers(): Promise<{
     syncedExclusions: number;
     durationMs: number;
     errors: string[];
+    totalUsers: number;
+    centralNodesCount: number;
+    skippedUsers: {
+      noActiveSubscription: number;
+      inactiveStatus: number;
+      leftChannel: number;
+      blocked: number;
+      muted: number;
+      detachedFromCentral: number;
+      missingFilePath: number;
+    };
     skippedUnchanged?: number;
     pushedCount?: number;
   };
   stats: any;
 }> {
-  const res = await fetch(`${API_BASE}/central-file/sync-subscribers?force=true`, {
+  const res = await fetch(`${API_BASE}/central-file/sync-subscribers?force=true&wait=true`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   });
@@ -1340,6 +1352,5 @@ export async function triggerManualGatewayAudit(): Promise<{
 
 // Alias for manual gateway sync pass
 export const runGatewayPass = triggerManualGatewayAudit;
-
 
 

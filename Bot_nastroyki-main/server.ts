@@ -2116,7 +2116,7 @@ function buildGitRemoteUrl(provider: GitProvider, owner: string, repo: string): 
   const encodedRepo = repo.split('/').map(encodeURIComponent).join('/');
 
   if (provider === 'sourcecraft') {
-    return `https://git.sourcecraft.dev/${encodedOwner}/${encodedRepo}.git`;
+    return `https://git@git.sourcecraft.dev/${encodedOwner}/${encodedRepo}.git`;
   }
   if (provider === 'github') {
     return `https://github.com/${encodedOwner}/${encodedRepo}.git`;
@@ -2136,7 +2136,9 @@ function buildGitRemoteUrl(provider: GitProvider, owner: string, repo: string): 
 function buildGitAuthEnv(provider: GitProvider, token: string, username?: string): NodeJS.ProcessEnv {
   const authUsername = provider === 'github'
     ? 'x-access-token'
-    : (username?.trim() || 'oauth2');
+    : provider === 'sourcecraft'
+      ? 'git'
+      : (username?.trim() || 'oauth2');
   const basicAuth = Buffer.from(`${authUsername}:${token.trim()}`).toString('base64');
   return {
     ...process.env,

@@ -1640,7 +1640,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 />
               </div>
 
-              {['sourcecraft', 'gitflic', 'moshub', 'gitlab'].includes(editingGit.provider || '') && (
+              {['gitflic', 'moshub', 'gitlab'].includes(editingGit.provider || '') && (
                 <div>
                   <label className="font-bold text-stone-700 block mb-1">Логин для Git HTTPS</label>
                   <input

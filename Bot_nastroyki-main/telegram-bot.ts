@@ -15,7 +15,7 @@ export interface TelegramBotManagerOptions {
   resolveUserDisplayKey: (user: any) => Promise<string>;
   applyDisconnectStub: (user: any, reason: string, sourceNum?: 1 | 2 | 3) => Promise<void>;
   restoreUserNodes: (user: any) => Promise<void>;
-  permanentlyDeleteUser: (user: any) => Promise<void | boolean>;
+  permanentlyDeleteUser: (user: any) => Promise<void | boolean | { success: true; repoCleanupFailed: boolean }>;
   parseNodeStats: (content: string) => { total: number; types?: any };
   resolveSecondDeviceRemoved?: (user: any) => Promise<{ success: boolean; message: string }>;
 }
@@ -1147,6 +1147,23 @@ export class TelegramBotManager {
 
       // If user already has a subscription, restore it!
       if (user.gitFilePath || user.hasActiveSubscription || user.subscriptionToken) {
+        let subscriptionFile: { filePath: string; rawUrl: string; finalUrl: string };
+        try {
+          const format = user.subscriptionType === 'incy' ? 'incy' : 'happ';
+          subscriptionFile = await this.options.ensureUserRepoFile(user, format);
+        } catch (err: any) {
+          console.warn(`[Subscription restore] Failed to ensure repository file for user ${user.telegramId}:`, err.message);
+          await this.tgApi(bot.token, 'sendMessage', {
+            chat_id: chatId,
+            text: '⚠️ Не удалось восстановить файл подписки в репозитории. Ссылка не выдана, чтобы не отправить неработающий адрес. Попробуйте позже или обратитесь к администратору.',
+            parse_mode: 'HTML',
+          });
+          return;
+        }
+
+        user.gitFilePath = subscriptionFile.filePath;
+        user.gitRawUrl = subscriptionFile.rawUrl;
+        user.finalSubscriptionUrl = subscriptionFile.finalUrl;
         user.status = 'active';
         user.hasActiveSubscription = true;
         user.isBlocked = false;
@@ -1160,13 +1177,10 @@ export class TelegramBotManager {
         user.boundDevice = null;
         user.deviceLocked = false;
         user.subscriptionStatusReason = undefined;
-        await this.options.restoreUserNodes(user);
-        const displayKey = await this.options.resolveUserDisplayKey(user).catch(() => '');
-        if (displayKey) {
-          user.finalSubscriptionUrl = displayKey;
-          user.finalUrl = displayKey;
-          user.clckUrl = displayKey;
-        }
+        const displayKey = subscriptionFile.finalUrl;
+        user.finalSubscriptionUrl = displayKey;
+        user.finalUrl = displayKey;
+        user.clckUrl = displayKey;
         this.options.saveStore();
 
         await this.tgApi(bot.token, 'sendMessage', {
@@ -1368,9 +1382,35 @@ export class TelegramBotManager {
     if (data === 'cmd_profile') {
       const isSubActive = Boolean(user.hasActiveSubscription);
       const isHapp = user.subscriptionType === 'happ';
-      const displayKey = isSubActive ? await this.options.resolveUserDisplayKey(user) : '';
+      let displayKey = '';
+      const canRefreshRepositoryFile = isSubActive &&
+        user.status === 'active' &&
+        user.channelMembership !== 'left' &&
+        !user.isBlocked &&
+        !user.isPermanentlyBanned;
+      if (canRefreshRepositoryFile) {
+        try {
+          const format = isHapp ? 'happ' : 'incy';
+          const subscriptionFile = await this.options.ensureUserRepoFile(user, format);
+          user.gitFilePath = subscriptionFile.filePath;
+          user.gitRawUrl = subscriptionFile.rawUrl;
+          displayKey = subscriptionFile.finalUrl;
+        } catch (err: any) {
+          console.warn(`[Subscription profile] Failed to ensure repository file for user ${user.telegramId}:`, err.message);
+          await this.tgApi(bot.token, 'sendMessage', {
+            chat_id: chatId,
+            text: '⚠️ Не удалось проверить и обновить файл подписки в репозитории. Ссылка не выдана, чтобы не отправить неработающий адрес. Попробуйте позже или обратитесь к администратору.',
+            parse_mode: 'HTML',
+          });
+          return;
+        }
+      } else {
+        displayKey = isSubActive ? await this.options.resolveUserDisplayKey(user) : '';
+      }
       if (isSubActive && displayKey) {
         user.finalSubscriptionUrl = displayKey;
+        user.finalUrl = displayKey;
+        user.clckUrl = displayKey;
         this.options.saveStore();
       }
 

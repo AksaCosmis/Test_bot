@@ -379,7 +379,7 @@ export async function bindUserDevice(id: string, clientName?: string): Promise<{
   return data;
 }
 
-export async function deleteUser(id: string): Promise<{ success: boolean }> {
+export async function deleteUser(id: string): Promise<{ success: boolean; message?: string; warning?: string }> {
   const res = await fetch(`${API_BASE}/users/${id}`, { method: 'DELETE' });
   const data = await res.json();
   if (!res.ok) throw new Error(data.message || 'Ошибка удаления пользователя');
@@ -1353,4 +1353,3 @@ export async function triggerManualGatewayAudit(): Promise<{
 
 // Alias for manual gateway sync pass
 export const runGatewayPass = triggerManualGatewayAudit;
-

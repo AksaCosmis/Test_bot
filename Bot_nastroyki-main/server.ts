@@ -1934,8 +1934,6 @@ function buildGitRawUrl(source: GitSourceItem, filePath: string): string {
     if (cachedSha && /^[0-9a-f]{40}$/i.test(cachedSha)) {
       return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${cachedSha}/${cleanPath}`;
     }
-    const shaMatch = (source.baseRawUrl || source.centralRawUrl || store.centralFile?.centralRawUrl || '').match(/\/raw\/[^\/]+\/[^\/]+\/([0-9a-f]{40})\//i);
-    if (shaMatch) return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${shaMatch[1]}/${cleanPath}`;
     return '';
   }
 
@@ -2676,7 +2674,11 @@ async function deleteGitVerseFile(params: {
   });
 }
 
-async function deleteActiveRepoFiles(filePaths: string[], commitMessage: (filePath: string) => string): Promise<boolean> {
+async function deleteActiveRepoFiles(
+  filePaths: string[],
+  commitMessage: (filePath: string) => string,
+  continueOnFailure = false
+): Promise<boolean> {
   const uniquePaths = [...new Set(filePaths.filter(Boolean))];
   if (uniquePaths.length === 0) return true;
 
@@ -2684,6 +2686,7 @@ async function deleteActiveRepoFiles(filePaths: string[], commitMessage: (filePa
   if (!activeGit.token?.trim()) return false;
   const { owner, repo } = getRepoParts(activeGit);
   const branch = activeGit.branch || getDefaultGitBranch(activeGit.provider);
+  let allDeleted = true;
 
   for (const filePath of uniquePaths) {
     const deleted = await deleteGitVerseFile({
@@ -2696,9 +2699,12 @@ async function deleteActiveRepoFiles(filePaths: string[], commitMessage: (filePa
       provider: activeGit.provider,
       apiUrl: activeGit.apiUrl,
     });
-    if (!deleted) return false;
+    if (!deleted) {
+      allDeleted = false;
+      if (!continueOnFailure) return false;
+    }
   }
-  return true;
+  return allDeleted;
 }
 
 // Helper: Ensure user has a subscription file directly in Git repository
@@ -3146,7 +3152,7 @@ async function applyUserUnblockAndReset(user: BotUser, preserveWarningCount = fa
 }
 
 // Permanently delete user subscription from GitVerse and system after deadline expires
-async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
+async function permanentlyDeleteUser(user: BotUser): Promise<{ success: true; repoCleanupFailed: boolean }> {
   const linkedExclusions = (store.exclusions || []).filter(
     (item) => item.userId === user.id || item.token === user.subscriptionToken
   );
@@ -3162,10 +3168,18 @@ async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
     ...linkedExclusions.map((item) => item.gitFilePath),
     ...relatedRepoFiles.map((file) => file.filePath),
   ].filter(Boolean) as string[];
-  const deleted = await deleteActiveRepoFiles(filePaths, (filePath) => `Permanently delete subscription ${filePath}`);
+  const deleted = await deleteActiveRepoFiles(
+    filePaths,
+    (filePath) => `Permanently delete subscription ${filePath}`,
+    true
+  );
   if (!deleted) {
-    console.warn(`[permanentlyDeleteUser] Could not delete repository files for user ${user.telegramId}; local record retained.`);
-    return false;
+    console.warn(`[permanentlyDeleteUser] User ${user.telegramId} will be removed locally, but one or more repository files could not be deleted.`);
+    logSystemEvent('warning', 'gitverse', 'USER_DELETE_REPO_CLEANUP_FAILED', `Пользователь ${user.telegramId} удален локально, но не все связанные файлы удалось удалить из Git-источника`, {
+      telegramId: user.telegramId,
+      filePaths,
+      source: getActiveGitSource().name,
+    });
   }
 
   if (store.repoFiles) {
@@ -3184,7 +3198,7 @@ async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
   store.users = store.users.filter((u) => u.id !== user.id && u.telegramId !== user.telegramId);
   saveStore();
   console.log(`[permanentlyDeleteUser] User @${user.username || user.telegramId} permanently deleted.`);
-  return true;
+  return { success: true, repoCleanupFailed: !deleted };
 }
 
 // State and statistics tracking for central propagation
@@ -5633,6 +5647,7 @@ app.post('/api/users/bulk-action', async (req, res) => {
 
   const activeBot = getActiveBot();
   let affectedCount = 0;
+  let repoCleanupFailed = false;
 
   if (action === 'mute') {
     const duration = Number(durationMinutes) || 60;
@@ -5704,9 +5719,18 @@ app.post('/api/users/bulk-action', async (req, res) => {
       ...relatedRepoFiles.map((file) => file.filePath),
     ].filter(Boolean) as string[];
 
-    const deleted = await deleteActiveRepoFiles(pathsToDelete, (filePath) => `Delete user subscription ${filePath}`);
+    const deleted = await deleteActiveRepoFiles(
+      pathsToDelete,
+      (filePath) => `Delete user subscription ${filePath}`,
+      true
+    );
     if (!deleted) {
-      return res.status(502).json({ success: false, message: `Не удалось удалить файлы подписок из активного Git-источника «${getActiveGitSource().name}». Пользователи оставлены в списке; проверьте токен, ветку и журнал ошибок.` });
+      repoCleanupFailed = true;
+      console.warn(`[bulk user delete] Users will be removed locally, but one or more subscription files could not be deleted from ${getActiveGitSource().name}.`);
+      logSystemEvent('warning', 'gitverse', 'BULK_USER_DELETE_REPO_CLEANUP_FAILED', `Пользователи удалены локально, но не все связанные файлы удалось удалить из Git-источника «${getActiveGitSource().name}»`, {
+        userIds: [...idsToDelete],
+        filePaths: pathsToDelete,
+      });
     }
 
     // Clean up repoFiles
@@ -5770,7 +5794,11 @@ app.post('/api/users/bulk-action', async (req, res) => {
 
   res.json({
     success: true,
-    message: `Действие "${action}" успешно применено к ${affectedCount} пользователям!`,
+    message: action === 'delete' && affectedCount > 0
+      ? repoCleanupFailed
+        ? `Удалено пользователей: ${affectedCount}. Не все файлы подписок удалось удалить из Git-источника «${getActiveGitSource().name}»; проверьте журнал ошибок.`
+        : `Пользователи удалены: ${affectedCount}.`
+      : `Действие "${action}" успешно применено к ${affectedCount} пользователям!`,
     affectedCount,
     users: store.users,
   });
@@ -7129,11 +7157,16 @@ app.delete('/api/users/:id', async (req, res) => {
   const { id } = req.params;
   const user = store.users.find((u) => u.id === id || u.telegramId === Number(id));
   if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
-  const deleted = await permanentlyDeleteUser(user);
-  if (!deleted) {
-    return res.status(502).json({ success: false, message: `Не удалось удалить подписку из активного Git-источника «${getActiveGitSource().name}». Пользователь оставлен в списке; проверьте токен, ветку и журнал ошибок.` });
-  }
-  res.json({ success: true });
+  const result = await permanentlyDeleteUser(user);
+  res.json({
+    success: true,
+    message: result.repoCleanupFailed
+      ? `Пользователь удален локально, но файл подписки не удалось удалить из Git-источника «${getActiveGitSource().name}». Проверьте настройки источника и журнал ошибок.`
+      : 'Пользователь и связанные локальные данные удалены.',
+    warning: result.repoCleanupFailed
+      ? 'Файл подписки в Git мог остаться и потребовать ручного удаления.'
+      : undefined,
+  });
 });
 
 // Helper functions for Docker deployment configs
@@ -9088,7 +9121,6 @@ app.post('/api/repo-files/generate-free', async (req, res) => {
   const activeGit = getActiveGitSource();
   if (!store.repoFiles) store.repoFiles = [];
 
-  const created: RepoUserFile[] = [];
   const centralContent = store.centralFile.content || '# Free Subscription';
   const sizeBytes = Buffer.byteLength(centralContent, 'utf-8');
   const nodesCount = parseNodeStats(centralContent).total;
@@ -9100,32 +9132,7 @@ app.post('/api/repo-files/generate-free', async (req, res) => {
   for (let i = 0; i < count; i++) {
     const randomId = Math.random().toString(36).substring(2, 8);
     const filePath = `subs/sub_pool_${randomId}.txt`;
-    const rawUrl = buildGitRawUrl(activeGit, filePath);
-
     filesToCommit.push({ filePath, content: centralContent });
-
-    const fileRecord: RepoUserFile = {
-      id: `sub_file_${randomId}`,
-      userId: null,
-      telegramId: null,
-      username: null,
-      firstName: null,
-      filePath,
-      rawUrl,
-      updatedAt: new Date().toISOString(),
-      format: 'standard',
-      finalUrl: rawUrl,
-      sizeBytes,
-      isPoolFree: true,
-      lastCheckedAt: new Date().toISOString(),
-      httpStatus: 200,
-      isAccessible: true,
-      latencyMs: Math.floor(90 + Math.random() * 60),
-      nodesFound: nodesCount,
-    };
-
-    store.repoFiles.unshift(fileRecord);
-    created.push(fileRecord);
   }
 
   let commitSha = '';
@@ -9147,7 +9154,7 @@ app.post('/api/repo-files/generate-free', async (req, res) => {
       commitSha = gitResult.sha || '';
       pushError = gitResult.error || '';
     } else {
-      let anyOk = false;
+      let allSucceeded = true;
       for (const item of filesToCommit) {
         const r = await createOrUpdateGitVerseFile({
           token: activeGit.token,
@@ -9160,11 +9167,52 @@ app.post('/api/repo-files/generate-free', async (req, res) => {
           provider: activeGit.provider,
           apiUrl: activeGit.apiUrl,
         });
-        if (r.success) anyOk = true;
+        if (!r.success) {
+          allSucceeded = false;
+          pushError = r.error || `Не удалось записать ${item.filePath}`;
+        }
       }
-      pushSuccess = anyOk;
+      pushSuccess = allSucceeded;
     }
+  } else {
+    pushError = 'Токен доступа не настроен в активном источнике Git';
   }
+
+  if (!pushSuccess) {
+    return res.status(502).json({
+      success: false,
+      message: `Не удалось создать файлы в репозитории ${activeGit.name}: ${pushError || 'проверьте токен и доступ к репозиторию'}`,
+      created: [],
+      totalFree: store.repoFiles.filter((f) => !f.userId || f.isPoolFree).length,
+    });
+  }
+
+  const created: RepoUserFile[] = filesToCommit.map(({ filePath }) => {
+    const randomId = path.basename(filePath, '.txt').replace('sub_pool_', '');
+    const rawUrl = commitSha && activeGit.provider === 'sourcecraft'
+      ? `https://raw.sourcecraft.tech/raw/${owner}/${repo}/${commitSha}/${filePath}`
+      : buildGitRawUrl(activeGit, filePath);
+    return {
+      id: `sub_file_${randomId}`,
+      userId: null,
+      telegramId: null,
+      username: null,
+      firstName: null,
+      filePath,
+      rawUrl,
+      updatedAt: new Date().toISOString(),
+      format: 'standard',
+      finalUrl: rawUrl,
+      sizeBytes,
+      isPoolFree: true,
+      lastCheckedAt: new Date().toISOString(),
+      httpStatus: 200,
+      isAccessible: true,
+      latencyMs: Math.floor(90 + Math.random() * 60),
+      nodesFound: nodesCount,
+    };
+  });
+  store.repoFiles.unshift(...created);
 
   for (const c of created) {
     if (commitSha && activeGit.provider === 'sourcecraft') {
@@ -9172,15 +9220,12 @@ app.post('/api/repo-files/generate-free', async (req, res) => {
       c.rawUrl = `https://raw.sourcecraft.tech/raw/${owner}/${repo}/${commitSha}/${c.filePath}`;
       c.finalUrl = c.rawUrl;
     }
-    c.isAccessible = pushSuccess;
   }
 
   saveStore();
   res.json({
     success: true,
-    message: pushSuccess
-      ? `Успешно создано и сохранено в репозитории ${created.length} свободных файлов-ссылок!`
-      : `Файлы созданы локально, но произошла ошибка при сохранении в репозиторий: ${pushError || 'проверьте токен'}`,
+    message: `Успешно создано и сохранено в репозитории ${created.length} свободных файлов-ссылок!`,
     created,
     totalFree: store.repoFiles.filter((f) => !f.userId || f.isPoolFree).length,
   });
@@ -9529,10 +9574,23 @@ AllowedIPs = 0.0.0.0/0`;
   // 5. Shadowrocket raw
   const shadowrocketConfig = rawContent;
 
-  // Direct GitVerse raw URL for this user
+  // Direct repository RAW URL for this user's subscription file
   const activeGit = getActiveGitSource();
   const matchedUser = store.users.find((u) => u.subscriptionToken === userToken);
   const rawFileUrl = (matchedUser && matchedUser.gitRawUrl) || buildGitRawUrl(activeGit, (matchedUser && matchedUser.gitFilePath) || `subs/${userToken}.txt`);
+  const storedHappUrl = matchedUser?.finalSubscriptionUrl?.startsWith('happ://crypt5/')
+    ? matchedUser.finalSubscriptionUrl
+    : '';
+  const storedHappTarget = storedHappUrl.match(/^happ:\/\/crypt5\/([A-Za-z0-9+/=_-]+)=ff$/)?.[1];
+  const storedHappTargetIsLocal = storedHappTarget
+    ? /^(?:https?:\/\/)?(?:localhost|127(?:\.\d{1,3}){3})(?::|\/|$)/i.test(Buffer.from(storedHappTarget, 'base64').toString('utf8'))
+    : false;
+  const happSubscriptionUrl = matchedUser?.finalSubscriptionUrl?.startsWith('happ://crypt5/')
+    && !storedHappTargetIsLocal
+    ? matchedUser.finalSubscriptionUrl
+    : rawFileUrl
+      ? convertToHappCrypt5(rawFileUrl, userToken, matchedUser?.telegramId || 0)
+      : '';
 
   return [
     {
@@ -9541,8 +9599,8 @@ AllowedIPs = 0.0.0.0/0`;
       client: 'HAPP / v2rayNG / Streisand / V2Box',
       filename: `${userName}_happ_crypt5.txt`,
       content: base64Content,
-      url: matchedUser?.finalSubscriptionUrl?.startsWith('happ://') ? matchedUser.finalSubscriptionUrl : `${subUrl}?format=crypt5`,
-      shortUrl: matchedUser?.finalSubscriptionUrl || rawFileUrl,
+      url: happSubscriptionUrl,
+      shortUrl: happSubscriptionUrl || rawFileUrl,
     },
     {
       id: 'incy',

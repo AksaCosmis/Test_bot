@@ -65,7 +65,7 @@ interface UsersChannelViewProps {
   onSyncCentralToSubscribers?: () => Promise<any>;
   onForceResyncUser?: (id: string) => Promise<any>;
   onAddUser: (user: any) => Promise<void>;
-  onDeleteUser: (id: string) => Promise<void>;
+  onDeleteUser: (id: string) => Promise<{ warning?: string } | void>;
   onMuteUser: (id: string, durationMinutes: number) => Promise<void>;
   onUnmuteUser: (id: string) => Promise<void>;
   onBlockUser: (id: string, reason?: string) => Promise<void>;
@@ -549,7 +549,10 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
   const handleDeleteUser = async (user: BotUser) => {
     setDeletingUserId(user.id);
     try {
-      await onDeleteUser(user.id);
+      const result = await onDeleteUser(user.id);
+      if (result?.warning) {
+        alert(result.warning);
+      }
     } catch (err: any) {
       alert(err.message || `Не удалось удалить подписку пользователя ${user.telegramId}`);
     } finally {

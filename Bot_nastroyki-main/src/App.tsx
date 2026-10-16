@@ -363,8 +363,9 @@ export default function App() {
   };
 
   const handleDeleteUser = async (id: string) => {
-    await deleteUser(id);
+    const result = await deleteUser(id);
     await loadAllData();
+    return { warning: result.warning };
   };
 
   const handleTerminateUser = async (id: string) => {

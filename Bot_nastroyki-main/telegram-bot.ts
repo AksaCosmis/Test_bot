@@ -1269,7 +1269,7 @@ export class TelegramBotManager {
         // Physical allocation / creation of subscription
         const subResult = await this.options.ensureUserRepoFile(user, format);
         const subTypeName = isHapp ? 'HAPP (crypt5)' : 'INCY';
-        const totalServers = this.options.parseNodeStats(store.centralFile.content).total;
+        const totalServers = 'содержимое центрального источника без преобразований';
         const hours = bot.selfDeleteHours || 72;
 
         user.receivedAt = user.receivedAt || new Date().toISOString();

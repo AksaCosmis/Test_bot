@@ -1844,6 +1844,16 @@ function getFullSubscriptionContent(user?: BotUser | null, exclusion?: Exclusion
   return central;
 }
 
+function getUserRepoSubscriptionContent(user: BotUser): string {
+  const linkedExclusion = store.exclusions?.find(
+    (item) => item.userId === user.id || item.token === user.subscriptionToken
+  );
+  if (user.detachedFromCentral || linkedExclusion) {
+    return getFullSubscriptionContent(user, null);
+  }
+  return store.centralFile?.content || '';
+}
+
 // Helper: Parse Nodes from text
 function parseNodeStats(content: string) {
   const normalized = normalizeToVpnUris(content);
@@ -2698,29 +2708,20 @@ async function ensureUserRepoFile(
   const activeGit = getActiveGitSource();
   const tokenSafe = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
 
-  // If user already has an allocated file in Git repo, reuse the exact same file!
+  // Reuse an existing allocation; new users always receive a token-specific file.
   let filePath = user.gitFilePath;
   let gitRawUrl = user.gitRawUrl;
 
   if (!filePath || !gitRawUrl) {
-    // Check if there is an unassigned / free file in store.repoFiles pool
-    if (!store.repoFiles) store.repoFiles = [];
-    const freeFile = store.repoFiles.find((f) => !f.userId || f.isPoolFree);
-    if (freeFile) {
-      filePath = freeFile.filePath;
-      gitRawUrl = buildGitRawUrl(activeGit, filePath);
-    } else {
-      // Create new personal file
-      filePath = `subs/${tokenSafe}.txt`;
-      gitRawUrl = buildGitRawUrl(activeGit, filePath);
-    }
+    filePath = `subs/${tokenSafe}.txt`;
+    gitRawUrl = buildGitRawUrl(activeGit, filePath);
   } else {
     // Always refresh gitRawUrl against activeGit in case repo or branch was changed
     gitRawUrl = buildGitRawUrl(activeGit, filePath);
   }
 
   // Determine actual node content to write
-  const nodeContent = getFullSubscriptionContent(user, null);
+  const nodeContent = getUserRepoSubscriptionContent(user);
 
   // CRITICAL: Physically create or update the file in Git repository (GitVerse, SourceCraft, etc.)
   if (!activeGit.token?.trim()) {
@@ -2821,7 +2822,7 @@ async function ensureUserRepoFile(
   user.boundDevice = null;
 
   // Calculate user config size
-  const userContent = getFullSubscriptionContent(user, null);
+  const userContent = getUserRepoSubscriptionContent(user);
   const userSizeBytes = Buffer.byteLength(userContent, 'utf-8');
 
   // Upsert in store.repoFiles
@@ -2975,7 +2976,7 @@ async function restoreUserNodes(user: BotUser): Promise<void> {
   const { owner, repo } = getRepoParts(activeGit);
 
   try {
-    const userContent = getFullSubscriptionContent(user, null);
+    const userContent = getUserRepoSubscriptionContent(user);
     const contentHash = crypto.createHash('sha256').update(userContent).digest('hex');
 
     const gitRes = await createOrUpdateGitVerseFile({
@@ -3148,7 +3149,11 @@ async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
     (item) => item.userId === user.id || item.token === user.subscriptionToken
   );
   const relatedRepoFiles = (store.repoFiles || []).filter(
-    (file) => file.userId === user.id || file.telegramId === user.telegramId
+    (file) =>
+      file.userId === user.id ||
+      file.telegramId === user.telegramId ||
+      file.id === `sub_${user.subscriptionToken}` ||
+      file.filePath.endsWith(`/${user.subscriptionToken}.txt`)
   );
   const filePaths = [
     user.gitFilePath,
@@ -3163,7 +3168,12 @@ async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
 
   if (store.repoFiles) {
     store.repoFiles = store.repoFiles.filter(
-      (f) => !filePaths.includes(f.filePath) && f.userId !== user.id && f.telegramId !== user.telegramId
+      (f) =>
+        !filePaths.includes(f.filePath) &&
+        f.userId !== user.id &&
+        f.telegramId !== user.telegramId &&
+        f.id !== `sub_${user.subscriptionToken}` &&
+        !f.filePath.endsWith(`/${user.subscriptionToken}.txt`)
     );
   }
   store.exclusions = (store.exclusions || []).filter(
@@ -3186,7 +3196,8 @@ interface CentralSyncResult {
   durationMs: number;
   errors: string[];
   totalUsers: number;
-  centralNodesCount: number;
+  centralContentBytes: number;
+  centralContentHash: string;
   skippedUsers: {
     noActiveSubscription: number;
     inactiveStatus: number;
@@ -3217,7 +3228,8 @@ let lastCentralSyncStats: CentralSyncResult = {
   durationMs: 0,
   errors: [],
   totalUsers: 0,
-  centralNodesCount: 0,
+  centralContentBytes: 0,
+  centralContentHash: '',
   skippedUsers: emptySkippedUsers(),
 };
 
@@ -3285,7 +3297,9 @@ async function syncActiveSubscribersWithCentral(options?: {
       u.gitFilePath
   );
   const totalUsers = store.users.length;
-  const centralNodesCount = parseNodeStats(store.centralFile?.content || '').total;
+  const centralContent = store.centralFile?.content || '';
+  const centralContentBytes = Buffer.byteLength(centralContent, 'utf-8');
+  const centralContentHash = crypto.createHash('sha256').update(centralContent).digest('hex');
 
   for (const u of eligibleUsers) {
     u.lastActiveAt = new Date().toISOString();
@@ -3316,7 +3330,7 @@ async function syncActiveSubscribersWithCentral(options?: {
 
   for (const user of eligibleUsers) {
     if (!user.gitFilePath || user.detachedFromCentral) continue;
-    const content = getFullSubscriptionContent(user, null);
+    const content = getUserRepoSubscriptionContent(user);
     const contentHash = crypto.createHash('sha256').update(content).digest('hex');
     const cleanPath = user.gitFilePath.replace(/^\/+/, '');
     if (!uniqueFilesToSync.has(cleanPath)) {
@@ -3523,7 +3537,13 @@ async function syncActiveSubscribersWithCentral(options?: {
             pushedCount++;
             syncedUsers += item.users.length;
             syncedExclusions += item.exclusions.length;
-            logSystemEvent('success', 'sync', 'FILE_COMMITTED', `Файл ${filePath} обновлен в репозитории GitVerse (${parseNodeStats(item.content).total} узлов)`, { filePath, nodes: parseNodeStats(item.content).total, sha: gitRes.sha });
+            const contentBytes = Buffer.byteLength(item.content, 'utf-8');
+            logSystemEvent('success', 'sync', 'FILE_COMMITTED', `Файл ${filePath} синхронизирован в ${activeGit.name} (${contentBytes} байт)`, {
+              filePath,
+              contentBytes,
+              contentHash: item.contentHash,
+              sha: gitRes.sha,
+            });
           } else {
             errors.push(`File ${filePath}: ${gitRes.error || 'Ошибка GitVerse'}`);
             logSystemEvent('error', 'sync', 'FILE_ERROR', `Ошибка обновления файла ${filePath} в GitVerse: ${gitRes.error}`, { filePath, error: gitRes.error });
@@ -3575,7 +3595,8 @@ async function syncActiveSubscribersWithCentral(options?: {
           durationMs: Date.now() - startTime,
           errors,
           totalUsers,
-          centralNodesCount,
+          centralContentBytes,
+          centralContentHash,
           skippedUsers,
           skippedUnchanged,
           pushedCount,
@@ -3593,7 +3614,8 @@ async function syncActiveSubscribersWithCentral(options?: {
       durationMs,
       errors,
       totalUsers,
-      centralNodesCount,
+      centralContentBytes,
+      centralContentHash,
       skippedUsers,
       skippedUnchanged,
       pushedCount,
@@ -3612,7 +3634,8 @@ async function syncActiveSubscribersWithCentral(options?: {
     durationMs,
     errors,
     totalUsers,
-    centralNodesCount,
+    centralContentBytes,
+    centralContentHash,
     skippedUsers,
     skippedUnchanged,
     pushedCount,
@@ -3865,7 +3888,7 @@ async function forceResyncSubscriber(user: BotUser): Promise<{ success: boolean;
     user.finalSubscriptionUrl = alloc.finalUrl;
   }
 
-  const content = getFullSubscriptionContent(user, null);
+  const content = getUserRepoSubscriptionContent(user);
   const stats = parseNodeStats(content);
   const sizeBytes = Buffer.byteLength(content, 'utf-8');
 
@@ -8597,7 +8620,7 @@ app.post('/api/central-file/sync-subscribers', async (req, res) => {
     const eligibleUsers = result.totalUsers - Object.values(result.skippedUsers).reduce((sum, count) => sum + count, 0);
     res.json({
       success: result.errors.length === 0,
-      message: `Центральных узлов: ${result.centralNodesCount}. Обновлено подписок: ${result.syncedUsers} из ${eligibleUsers} активных пользователей (${result.totalUsers} всего). Git-файлов записано: ${result.pushedCount || 0}, без изменений: ${result.skippedUnchanged || 0}, ошибок: ${result.errors.length}.${skippedSummary ? ` Пропущено (${skippedSummary}).` : ''}`,
+      message: `Центральный текст ${result.centralContentBytes} байт (SHA-256: ${result.centralContentHash.slice(0, 12)}). Синхронизировано файлов подписок: ${result.syncedUsers} из ${eligibleUsers} активных пользователей (${result.totalUsers} всего); записано в Git: ${result.pushedCount || 0}, без изменений: ${result.skippedUnchanged || 0}, ошибок: ${result.errors.length}.${skippedSummary ? ` Пропущено (${skippedSummary}).` : ''}`,
       syncResult: result,
       stats,
     });
@@ -8644,7 +8667,7 @@ app.post('/api/sync/deep-audit-force', async (req, res) => {
             store.centralFile.lastUpdatedAt = new Date().toISOString();
             store.centralFile.lastCommitMessage = `Deep Audit auto-pulled from remote repository at ${new Date().toLocaleTimeString('ru-RU')}`;
             remoteCentralPulled = true;
-            logSystemEvent('info', 'sync', 'REMOTE_CENTRAL_UPDATED', `Центральная конфигурация обновлена из удаленного репозитория GitVerse (${parseNodeStats(remoteCentralContent).total} узлов)`, { path: centralFile, length: remoteCentralContent.length });
+            logSystemEvent('info', 'sync', 'REMOTE_CENTRAL_UPDATED', `Центральное содержимое обновлено из удаленного репозитория (${Buffer.byteLength(remoteCentralContent, 'utf-8')} байт)`, { path: centralFile, length: remoteCentralContent.length });
           }
         }
       }
@@ -10981,7 +11004,7 @@ app.post('/api/bot/simulate', async (req, res) => {
     const { filePath, rawUrl, finalUrl } = await ensureUserRepoFile(dbUser, format);
 
     const subTypeName = isHapp ? 'HAPP (crypt5)' : 'INCY';
-    const totalServers = parseNodeStats(store.centralFile.content).total;
+    const totalServers = 'содержимое центрального источника без преобразований';
 
     dbUser.receivedAt = dbUser.receivedAt || new Date().toISOString();
     dbUser.subscriptionName = subTypeName;

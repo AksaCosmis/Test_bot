@@ -948,7 +948,7 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
               <div>
                 <span className="font-semibold">Синхронизация с подписчиками выполнена ({lastSyncSubscribersResult.timestamp}):</span>{' '}
                 <span>
-                  {lastSyncSubscribersResult.syncedUsers} активных файлов пользователей обновлено, {lastSyncSubscribersResult.syncedExclusions} исключений актуализировано.
+                  Файлов подписок обработано: {lastSyncSubscribersResult.syncedUsers}; файлов исключений: {lastSyncSubscribersResult.syncedExclusions}.
                 </span>
               </div>
             </div>
@@ -958,7 +958,7 @@ export const CentralSubscriptionView: React.FC<CentralSubscriptionViewProps> = (
                 <span>{lastSyncSubscribersResult.durationMs} мс</span>
               </span>
               <span className="px-2.5 py-0.5 rounded-full bg-emerald-200 text-emerald-800 text-[11px] font-bold">
-                Все пользователи синхронизированы
+                Синхронизация файлов завершена
               </span>
             </div>
           </div>

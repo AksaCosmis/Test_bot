@@ -446,7 +446,8 @@ export async function syncCentralToSubscribers(): Promise<{
     durationMs: number;
     errors: string[];
     totalUsers: number;
-    centralNodesCount: number;
+    centralContentBytes: number;
+    centralContentHash: string;
     skippedUsers: {
       noActiveSubscription: number;
       inactiveStatus: number;
@@ -1352,5 +1353,4 @@ export async function triggerManualGatewayAudit(): Promise<{
 
 // Alias for manual gateway sync pass
 export const runGatewayPass = triggerManualGatewayAudit;
-
 

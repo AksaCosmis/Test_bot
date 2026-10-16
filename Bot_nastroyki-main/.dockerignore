@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.cache
+data-store.json
+data-store.json.initial
+firebase-applet-config.json
+*.log
+npm-debug.log*
+.DS_Store

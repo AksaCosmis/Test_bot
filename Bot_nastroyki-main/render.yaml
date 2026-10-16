@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: puls-dostupa
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: AUTO_RESTART_HOURS
+        value: 24
+      - key: TZ
+        value: Europe/Moscow
+      - key: FIREBASE_CONFIG_JSON
+        sync: false

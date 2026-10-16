@@ -1426,8 +1426,10 @@ function loadLocalStore(): StoreData | null {
   return null;
 }
 
-// In-memory runtime store initialized with local saved state or defaults
-let store: StoreData = loadLocalStore() || { ...defaultStore };
+// Initialize the default store before normalizing local state, which may call helpers that read it.
+let store: StoreData = { ...defaultStore };
+const initialLocalStore = loadLocalStore();
+if (initialLocalStore) store = initialLocalStore;
 let isStoreInitialized = false;
 let lastLocalSaveTimestamp = 0;
 let unsubscribeFirebase: (() => void) | null = null;
@@ -1923,11 +1925,11 @@ function buildGitRawUrl(source: GitSourceItem, filePath: string): string {
       return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${cachedSha}/${cleanPath}`;
     }
     const shaMatch = (source.baseRawUrl || source.centralRawUrl || store.centralFile?.centralRawUrl || '').match(/\/raw\/[^\/]+\/[^\/]+\/([0-9a-f]{40})\//i);
-    const targetRef = shaMatch ? shaMatch[1] : 'b10033a9ce8a1c8b075a82fd2ea4b1aa9431284e';
-    return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${targetRef}/${cleanPath}`;
+    if (shaMatch) return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${shaMatch[1]}/${cleanPath}`;
+    return '';
   }
 
-  if (source.baseRawUrl && source.baseRawUrl.toLowerCase().includes(cleanRepo.toLowerCase())) {
+  if (source.provider === 'custom' && source.baseRawUrl && source.baseRawUrl.toLowerCase().includes(cleanRepo.toLowerCase())) {
     try {
       const u = new URL(source.baseRawUrl);
       const repoIdx = u.pathname.toLowerCase().indexOf(cleanRepo.toLowerCase());
@@ -1960,6 +1962,20 @@ function buildGitRepositoryWebUrl(source: GitSourceItem): string {
   if (source.provider === 'github') return `https://github.com/${repository}`;
   if (source.provider === 'gitlab') return `https://gitlab.com/${repository}`;
   return `https://gitverse.ru/${repository}`;
+}
+
+function repositoryPathFromInput(value: string, provider: GitProvider): string {
+  const input = value.trim();
+  try {
+    const url = new URL(input);
+    let path = decodeURIComponent(url.pathname).replace(/^\/+|\/+$/g, '');
+    if (provider === 'gitflic') path = path.replace(/^project\//i, '');
+    return path.replace(/\.git$/i, '');
+  } catch {
+    let path = input.replace(/^https?:\/\/[^/]+\//i, '').replace(/^\/+|\/+$/g, '');
+    if (provider === 'gitflic') path = path.replace(/^project\//i, '');
+    return path.replace(/\.git$/i, '');
+  }
 }
 
 // Helper: Encrypt raw GitVerse subscription link via crypto.happ.su (produces happ://crypt5/...=ff)
@@ -2010,11 +2026,11 @@ async function shortenIncyUrl(rawUrl: string, tokenSafe?: string): Promise<strin
     });
     const shortUrl = (await response.text()).trim();
     if (response.ok && /^https:\/\/clck\.ru\/[^\s]+$/i.test(shortUrl)) return shortUrl;
+    throw new Error(`clck.ru вернул неподходящий ответ (HTTP ${response.status})`);
   } catch (err: any) {
     console.warn('[clck.ru shortener warning]:', err.message);
+    throw new Error(`Не удалось сократить INCY-ссылку через clck.ru: ${err.message}`);
   }
-
-  return targetUrl;
 }
 
 // Helper: Resolve subscription display key for bot profile and messages
@@ -2055,7 +2071,7 @@ async function resolveUserDisplayKey(user: any): Promise<string> {
     user.clckUrl = incyUrl;
     user.clckTargetUrl = targetBaseUrl;
     saveStore();
-    return targetBaseUrl;
+    return incyUrl;
   }
 }
 
@@ -2085,27 +2101,40 @@ function usesGitCliProvider(provider: GitProvider): boolean {
   return provider === 'sourcecraft' || provider === 'gitflic' || provider === 'moshub' || provider === 'github' || provider === 'gitlab';
 }
 
-function buildGitRemoteUrl(provider: GitProvider, token: string, owner: string, repo: string): string {
+function buildGitRemoteUrl(provider: GitProvider, owner: string, repo: string): string {
   const encodedOwner = encodeURIComponent(owner);
   const encodedRepo = repo.split('/').map(encodeURIComponent).join('/');
-  const encodedToken = encodeURIComponent(token.trim());
 
   if (provider === 'sourcecraft') {
-    return `https://${encodeURIComponent(owner || 'oauth2')}:${encodedToken}@git.sourcecraft.dev/${encodedOwner}/${encodedRepo}.git`;
+    return `https://git.sourcecraft.dev/${encodedOwner}/${encodedRepo}.git`;
   }
   if (provider === 'github') {
-    return `https://x-access-token:${encodedToken}@github.com/${encodedOwner}/${encodedRepo}.git`;
+    return `https://github.com/${encodedOwner}/${encodedRepo}.git`;
   }
   if (provider === 'gitlab') {
-    return `https://oauth2:${encodedToken}@gitlab.com/${encodedOwner}/${encodedRepo}.git`;
+    return `https://gitlab.com/${encodedOwner}/${encodedRepo}.git`;
   }
   if (provider === 'gitflic') {
-    return `https://${encodeURIComponent(owner || 'token')}:${encodedToken}@gitflic.ru/project/${encodedOwner}/${encodedRepo}.git`;
+    return `https://gitflic.ru/project/${encodedOwner}/${encodedRepo}.git`;
   }
   if (provider === 'moshub') {
-    return `https://oauth2:${encodedToken}@hub.mos.ru/${encodedOwner}/${encodedRepo}.git`;
+    return `https://hub.mos.ru/${encodedOwner}/${encodedRepo}.git`;
   }
-  return `https://${encodedToken}@gitverse.ru/${encodedOwner}/${encodedRepo}.git`;
+  return `https://gitverse.ru/${encodedOwner}/${encodedRepo}.git`;
+}
+
+function buildGitAuthEnv(provider: GitProvider, token: string, username?: string): NodeJS.ProcessEnv {
+  const authUsername = provider === 'github'
+    ? 'x-access-token'
+    : (username?.trim() || 'oauth2');
+  const basicAuth = Buffer.from(`${authUsername}:${token.trim()}`).toString('base64');
+  return {
+    ...process.env,
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.extraheader',
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: Basic ${basicAuth}`,
+    GIT_TERMINAL_PROMPT: '0',
+  };
 }
 
 // High-Speed GitVerse Operations Throttle & Semaphore (Strict serial queue to eliminate branch ref locks)
@@ -2190,11 +2219,13 @@ async function batchCommitFilesViaGitCli(params: {
   files: Array<{ filePath: string; content: string }>;
   commitMessage: string;
   provider: GitProvider;
+  username?: string;
 }): Promise<{ success: boolean; sha?: string; error?: string }> {
-  const { token, owner, repo, branch, files, commitMessage, provider } = params;
+  const { token, owner, repo, branch, files, commitMessage, provider, username } = params;
   if (!files || files.length === 0) return { success: true };
   const branchName = branch || getDefaultGitBranch(provider);
-  const remoteUrl = buildGitRemoteUrl(provider, token, owner, repo);
+  const remoteUrl = buildGitRemoteUrl(provider, owner, repo);
+  const gitEnv = buildGitAuthEnv(provider, token, username);
 
   const safeOwnerRepo = `${owner}_${repo}`.replace(/[^a-zA-Z0-9_-]/g, '_');
   const repoDir = path.join('/tmp', 'git_cache', `${provider}_${safeOwnerRepo}`);
@@ -2215,22 +2246,22 @@ async function batchCommitFilesViaGitCli(params: {
     if (needsClone) {
       await fs.promises.rm(repoDir, { recursive: true, force: true }).catch(() => {});
       try {
-        await execFileAsync('git', ['clone', '--depth', '1', '-b', branchName, remoteUrl, repoDir], { timeout: 35000 });
+        await execFileAsync('git', ['clone', '--depth', '1', '-b', branchName, remoteUrl, repoDir], { timeout: 35000, env: gitEnv });
       } catch {
-        await execFileAsync('git', ['clone', '--depth', '1', remoteUrl, repoDir], { timeout: 35000 });
+        await execFileAsync('git', ['clone', '--depth', '1', remoteUrl, repoDir], { timeout: 35000, env: gitEnv });
         try {
-          await execFileAsync('git', ['checkout', '-B', branchName], { cwd: repoDir, timeout: 10000 });
+          await execFileAsync('git', ['checkout', '-B', branchName], { cwd: repoDir, timeout: 10000, env: gitEnv });
         } catch {}
       }
     } else {
       try {
-        await execFileAsync('git', ['remote', 'set-url', 'origin', remoteUrl], { cwd: repoDir, timeout: 5000 });
-        await execFileAsync('git', ['fetch', '--depth', '1', 'origin', branchName], { cwd: repoDir, timeout: 25000 });
-        await execFileAsync('git', ['checkout', branchName], { cwd: repoDir, timeout: 5000 });
-        await execFileAsync('git', ['reset', '--hard', `origin/${branchName}`], { cwd: repoDir, timeout: 5000 });
+        await execFileAsync('git', ['remote', 'set-url', 'origin', remoteUrl], { cwd: repoDir, timeout: 5000, env: gitEnv });
+        await execFileAsync('git', ['fetch', '--depth', '1', 'origin', branchName], { cwd: repoDir, timeout: 25000, env: gitEnv });
+        await execFileAsync('git', ['checkout', branchName], { cwd: repoDir, timeout: 5000, env: gitEnv });
+        await execFileAsync('git', ['reset', '--hard', `origin/${branchName}`], { cwd: repoDir, timeout: 5000, env: gitEnv });
       } catch {
         await fs.promises.rm(repoDir, { recursive: true, force: true }).catch(() => {});
-        await execFileAsync('git', ['clone', '--depth', '1', '-b', branchName, remoteUrl, repoDir], { timeout: 35000 });
+        await execFileAsync('git', ['clone', '--depth', '1', '-b', branchName, remoteUrl, repoDir], { timeout: 35000, env: gitEnv });
       }
     }
 
@@ -2253,7 +2284,7 @@ async function batchCommitFilesViaGitCli(params: {
     const revParse = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, timeout: 5000 });
     commitSha = revParse.stdout.trim();
 
-    await execFileAsync('git', ['push', 'origin', branchName], { cwd: repoDir, timeout: 30000 });
+    await execFileAsync('git', ['push', 'origin', branchName], { cwd: repoDir, timeout: 30000, env: gitEnv });
 
     return { success: true, sha: commitSha };
   } catch (err: any) {
@@ -2272,6 +2303,7 @@ async function commitFileViaGitCli(params: {
   content: string;
   commitMessage: string;
   provider: GitProvider;
+  username?: string;
 }): Promise<{ success: boolean; sha?: string; error?: string }> {
   return batchCommitFilesViaGitCli({
     token: params.token,
@@ -2281,6 +2313,7 @@ async function commitFileViaGitCli(params: {
     files: [{ filePath: params.filePath, content: params.content }],
     commitMessage: params.commitMessage,
     provider: params.provider,
+    username: params.username,
   });
 }
 
@@ -2293,15 +2326,17 @@ async function deleteFileViaGitCli(params: {
   filePath: string;
   commitMessage?: string;
   provider: GitProvider;
+  username?: string;
 }): Promise<boolean> {
-  const { token, owner, repo, branch, filePath, commitMessage, provider } = params;
+  const { token, owner, repo, branch, filePath, commitMessage, provider, username } = params;
   const cleanPath = filePath.replace(/^\/+/, '');
   const branchName = branch || getDefaultGitBranch(provider);
   const safeOwnerRepo = `${owner}_${repo}`.replace(/[^a-zA-Z0-9_-]/g, '_');
   const repoDir = path.join('/tmp', 'git_cache', `${provider}_${safeOwnerRepo}`);
 
   try {
-    const remoteUrl = buildGitRemoteUrl(provider, token, owner, repo);
+    const remoteUrl = buildGitRemoteUrl(provider, owner, repo);
+    const gitEnv = buildGitAuthEnv(provider, token, username);
     await fs.promises.mkdir('/tmp/git_cache', { recursive: true });
     let hasClone = false;
     try {
@@ -2309,12 +2344,12 @@ async function deleteFileViaGitCli(params: {
     } catch {}
     if (!hasClone) {
       await fs.promises.rm(repoDir, { recursive: true, force: true });
-      await execFileAsync('git', ['clone', '--depth', '1', '-b', branchName, remoteUrl, repoDir], { timeout: 35000 });
+      await execFileAsync('git', ['clone', '--depth', '1', '-b', branchName, remoteUrl, repoDir], { timeout: 35000, env: gitEnv });
     }
-    await execFileAsync('git', ['remote', 'set-url', 'origin', remoteUrl], { cwd: repoDir, timeout: 5000 }).catch(() => {});
-    await execFileAsync('git', ['fetch', '--depth', '1', 'origin', branchName], { cwd: repoDir, timeout: 25000 });
-    await execFileAsync('git', ['checkout', branchName], { cwd: repoDir, timeout: 5000 });
-    await execFileAsync('git', ['reset', '--hard', `origin/${branchName}`], { cwd: repoDir, timeout: 5000 });
+    await execFileAsync('git', ['remote', 'set-url', 'origin', remoteUrl], { cwd: repoDir, timeout: 5000, env: gitEnv }).catch(() => {});
+    await execFileAsync('git', ['fetch', '--depth', '1', 'origin', branchName], { cwd: repoDir, timeout: 25000, env: gitEnv });
+    await execFileAsync('git', ['checkout', branchName], { cwd: repoDir, timeout: 5000, env: gitEnv });
+    await execFileAsync('git', ['reset', '--hard', `origin/${branchName}`], { cwd: repoDir, timeout: 5000, env: gitEnv });
 
     const fullTargetFilePath = path.join(repoDir, cleanPath);
     await fs.promises.unlink(fullTargetFilePath).catch(() => {});
@@ -2322,7 +2357,7 @@ async function deleteFileViaGitCli(params: {
     const status = await execFileAsync('git', ['status', '--porcelain'], { cwd: repoDir, timeout: 5000 });
     if (!status.stdout.trim()) return true;
     await execFileAsync('git', ['commit', '-m', commitMessage || `Delete ${cleanPath}`], { cwd: repoDir, timeout: 10000 }).catch(() => {});
-    await execFileAsync('git', ['push', 'origin', branchName], { cwd: repoDir, timeout: 25000 });
+    await execFileAsync('git', ['push', 'origin', branchName], { cwd: repoDir, timeout: 25000, env: gitEnv });
     return true;
   } catch {
     return false;
@@ -2347,16 +2382,22 @@ async function createOrUpdateGitVerseFile(params: {
     const cleanPath = filePath.replace(/^\/+/, '');
     const cleanOwner = encodeURIComponent(owner);
     const cleanRepo = encodeURIComponent(repo);
-    const effectiveProvider = provider || getActiveGitSource().provider || 'gitverse';
+    const activeSource = getActiveGitSource();
+    const effectiveProvider = provider || activeSource.provider || 'gitverse';
     const isSourceCraft = effectiveProvider === 'sourcecraft';
     const branchName = branch || getDefaultGitBranch(effectiveProvider);
     const providerName = isSourceCraft ? 'SourceCraft' : (effectiveProvider === 'gitverse' ? 'GitVerse' : effectiveProvider.toUpperCase());
-    const apiBase = (apiUrl || (isSourceCraft ? 'https://api.sourcecraft.tech' : 'https://api.gitverse.ru')).replace(/\/+$/, '');
+    const apiBase = (
+      apiUrl ||
+      (effectiveProvider === activeSource.provider ? activeSource.apiUrl : undefined) ||
+      (isSourceCraft ? 'https://api.sourcecraft.tech' : 'https://api.gitverse.ru')
+    ).replace(/\/+$/, '');
     const rawUrl = buildGitRawUrl({
+      ...activeSource,
       provider: effectiveProvider,
       repository: `${owner}/${repo}`,
       branch: branchName,
-    } as any, cleanPath);
+    }, cleanPath);
 
     if (!token || !token.trim()) {
       console.warn(`[${providerName}] No API token provided for ${owner}/${repo}`);
@@ -2376,6 +2417,7 @@ async function createOrUpdateGitVerseFile(params: {
         content,
         commitMessage,
         provider: effectiveProvider,
+        username: activeSource.username || owner,
       });
 
       if (gitCliRes.success) {
@@ -2536,11 +2578,16 @@ async function deleteGitVerseFile(params: {
     const cleanPath = filePath.replace(/^\/+/, '');
     const cleanOwner = encodeURIComponent(owner);
     const cleanRepo = encodeURIComponent(repo);
-    const effectiveProvider = provider || getActiveGitSource().provider || 'gitverse';
+    const activeSource = getActiveGitSource();
+    const effectiveProvider = provider || activeSource.provider || 'gitverse';
     const isSourceCraft = effectiveProvider === 'sourcecraft';
     const branchName = branch || getDefaultGitBranch(effectiveProvider);
     const providerName = isSourceCraft ? 'SourceCraft' : (effectiveProvider === 'gitverse' ? 'GitVerse' : effectiveProvider.toUpperCase());
-    const apiBase = (apiUrl || (isSourceCraft ? 'https://api.sourcecraft.tech' : 'https://api.gitverse.ru')).replace(/\/+$/, '');
+    const apiBase = (
+      apiUrl ||
+      (effectiveProvider === activeSource.provider ? activeSource.apiUrl : undefined) ||
+      (isSourceCraft ? 'https://api.sourcecraft.tech' : 'https://api.gitverse.ru')
+    ).replace(/\/+$/, '');
 
     if (usesGitCliProvider(effectiveProvider)) {
       const deleted = await deleteFileViaGitCli({
@@ -2551,6 +2598,7 @@ async function deleteGitVerseFile(params: {
         filePath: cleanPath,
         commitMessage,
         provider: effectiveProvider,
+        username: activeSource.username || owner,
       });
       if (deleted) {
         gitFileMetadataCache.delete(cleanPath);
@@ -2569,7 +2617,10 @@ async function deleteGitVerseFile(params: {
           'User-Agent': 'PulsAccess/2.0',
         },
       });
-      if (checkRes.status === 404) return true;
+      if (checkRes.status === 404) {
+        gitFileMetadataCache.delete(cleanPath);
+        return true;
+      }
       if (!checkRes.ok) return false;
       const data: any = await checkRes.json();
       const sha = data?.sha || data?.content?.sha;
@@ -2592,6 +2643,7 @@ async function deleteGitVerseFile(params: {
         }),
       });
       if (delRes.ok) {
+        gitFileMetadataCache.delete(cleanPath);
         logSystemEvent('success', 'gitverse', 'DELETE_FILE', `Файл ${cleanPath} удален из ${providerName}`, { path: cleanPath });
       } else {
         logSystemEvent('error', 'gitverse', 'DELETE_FILE', `Ошибка удаления ${cleanPath} из ${providerName} (HTTP ${delRes.status})`, { path: cleanPath, status: delRes.status });
@@ -2650,14 +2702,6 @@ async function ensureUserRepoFile(
     if (freeFile) {
       filePath = freeFile.filePath;
       gitRawUrl = buildGitRawUrl(activeGit, filePath);
-      freeFile.userId = user.id;
-      freeFile.telegramId = user.telegramId;
-      freeFile.username = user.username;
-      freeFile.firstName = user.firstName;
-      freeFile.rawUrl = gitRawUrl;
-      freeFile.isPoolFree = false;
-      freeFile.updatedAt = new Date().toISOString();
-      freeFile.format = format;
     } else {
       // Create new personal file
       filePath = `subs/${tokenSafe}.txt`;
@@ -3093,8 +3137,15 @@ async function applyUserUnblockAndReset(user: BotUser, preserveWarningCount = fa
 
 // Permanently delete user subscription from GitVerse and system after deadline expires
 async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
-  const linkedExclusions = (store.exclusions || []).filter((item) => item.userId === user.id);
-  const filePaths = [user.gitFilePath, ...linkedExclusions.map((item) => item.gitFilePath)].filter(Boolean) as string[];
+  const linkedExclusions = (store.exclusions || []).filter(
+    (item) => item.userId === user.id || item.token === user.subscriptionToken
+  );
+  const relatedRepoFiles = (store.repoFiles || []).filter((file) => file.userId === user.id);
+  const filePaths = [
+    user.gitFilePath,
+    ...linkedExclusions.map((item) => item.gitFilePath),
+    ...relatedRepoFiles.map((file) => file.filePath),
+  ].filter(Boolean) as string[];
   const deleted = await deleteActiveRepoFiles(filePaths, (filePath) => `Permanently delete subscription ${filePath}`);
   if (!deleted) {
     console.warn(`[permanentlyDeleteUser] Could not delete repository files for user ${user.telegramId}; local record retained.`);
@@ -3104,7 +3155,9 @@ async function permanentlyDeleteUser(user: BotUser): Promise<boolean> {
   if (store.repoFiles) {
     store.repoFiles = store.repoFiles.filter((f) => !filePaths.includes(f.filePath) && f.userId !== user.id);
   }
-  store.exclusions = (store.exclusions || []).filter((item) => item.userId !== user.id);
+  store.exclusions = (store.exclusions || []).filter(
+    (item) => item.userId !== user.id && item.token !== user.subscriptionToken
+  );
   store.users = store.users.filter((u) => u.id !== user.id && u.telegramId !== user.telegramId);
   saveStore();
   console.log(`[permanentlyDeleteUser] User @${user.username || user.telegramId} permanently deleted.`);
@@ -3300,7 +3353,12 @@ async function syncActiveSubscribersWithCentral(options?: {
 
   // Background pusher for delta files (sequential processing to prevent git branch lock collisions)
   const runPushWorker = async () => {
-    if (!activeGit || !activeGit.token || !activeGit.token.trim() || filesToPush.length === 0) {
+    if (filesToPush.length === 0) {
+      isSyncingSubscribersWithCentral = false;
+      return;
+    }
+    if (!activeGit || !activeGit.token?.trim()) {
+      errors.push(`Не настроен API-токен активного Git-источника; не записано файлов: ${filesToPush.length}`);
       isSyncingSubscribersWithCentral = false;
       return;
     }
@@ -3996,7 +4054,7 @@ app.post('/api/git-sources', (req, res) => {
   if (existingIdx >= 0) {
     const current = store.gitSources[existingIdx];
     const isEnabled = item.enabled !== undefined ? item.enabled : (current.enabled ?? true);
-    const hasCreds = Boolean(item.token || current.token || item.apiUrl || current.apiUrl || item.provider === 'custom');
+    const hasCreds = Boolean(item.token?.trim() || current.token?.trim());
 
     let cleanApi = item.apiUrl !== undefined ? item.apiUrl : current.apiUrl;
     const provider = item.provider || current.provider;
@@ -4009,6 +4067,7 @@ app.post('/api/git-sources', (req, res) => {
     store.gitSources[existingIdx] = {
       ...current,
       ...item,
+      token: item.token?.trim() ? item.token : current.token,
       apiUrl: cleanApi,
       status: (isEnabled && hasCreds) ? 'connected' : 'not_configured',
       lastSyncAt: new Date().toISOString(),
@@ -4091,7 +4150,7 @@ app.post('/api/git-sources', (req, res) => {
     enabled: item.enabled ?? true,
     autoSync: item.autoSync ?? true,
     isDefault: item.isDefault ?? false,
-    status: (item.token || item.apiUrl || provider === 'custom') ? 'connected' : 'not_configured',
+    status: item.token?.trim() ? 'connected' : 'not_configured',
     lastSyncAt: new Date().toISOString(),
     errorMessage: undefined,
   };
@@ -4182,6 +4241,7 @@ app.post('/api/git-sources/:id/make-central', async (req, res) => {
   found.centralRawUrl = rawUrl;
 
   let pushMessage = '';
+  store.centralFile.isSyncedWithRepo = false;
   if (found.token && found.token.trim()) {
     const { owner, repo } = getRepoParts(found);
     const branch = found.branch || getDefaultGitBranch(found.provider);
@@ -4199,19 +4259,54 @@ app.post('/api/git-sources/:id/make-central', async (req, res) => {
     if (pushResult.success) {
       pushMessage = ` и файл ${filename} успешно зафиксирован в репозитории ${found.repository}`;
       store.centralFile.isSyncedWithRepo = true;
-      if (pushResult.rawUrl) store.centralFile.centralRawUrl = pushResult.rawUrl;
+      if (pushResult.rawUrl) {
+        store.centralFile.centralRawUrl = pushResult.rawUrl;
+        found.centralRawUrl = pushResult.rawUrl;
+      }
     } else {
       pushMessage = ` (коммит в репозиторий: ${pushResult.error || 'проверьте токен'})`;
+      saveStore();
+      return res.status(502).json({
+        success: false,
+        message: `Источник "${found.name}" выбран, но центральный файл не записан в репозиторий: ${pushResult.error || 'проверьте токен и доступ'}`,
+        activeGitSourceId: id,
+        gitSources: store.gitSources,
+        centralFile: store.centralFile,
+      });
     }
+  } else {
+    saveStore();
+    return res.status(409).json({
+      success: false,
+      message: `Источник "${found.name}" выбран, но для записи центрального файла нужен API-токен`,
+      activeGitSourceId: id,
+      gitSources: store.gitSources,
+      centralFile: store.centralFile,
+    });
   }
 
   saveStore();
+  const subscriberSync = await syncActiveSubscribersWithCentral({
+    forceFullGitPush: true,
+    backgroundGitPush: false,
+  });
+  if (subscriberSync.errors.length) {
+    return res.status(502).json({
+      success: false,
+      message: `Источник "${found.name}" выбран и центральный файл создан, но не удалось обновить ${subscriberSync.errors.length} файлов подписок: ${subscriberSync.errors.slice(0, 3).join('; ')}`,
+      activeGitSourceId: id,
+      gitSources: store.gitSources,
+      centralFile: store.centralFile,
+      syncResult: subscriberSync,
+    });
+  }
   res.json({
     success: true,
-    message: `Центральный источник успешно создан и привязан к "${found.name}"${pushMessage}!`,
+    message: `Центральный источник создан и привязан к "${found.name}"${pushMessage}. Подписки пользователей синхронизированы.`,
     activeGitSourceId: id,
     gitSources: store.gitSources,
     centralFile: store.centralFile,
+    syncResult: subscriberSync,
   });
 });
 
@@ -4230,8 +4325,19 @@ app.post('/api/git-sources/:id/test', async (req, res) => {
     }
 
     if (usesGitCliProvider(source.provider)) {
-      const remoteUrl = buildGitRemoteUrl(source.provider, cleanToken, owner, repo);
-      await execFileAsync('git', ['ls-remote', remoteUrl, 'HEAD'], { timeout: 15000 });
+      const remoteUrl = buildGitRemoteUrl(source.provider, owner, repo);
+      await execFileAsync('git', ['ls-remote', remoteUrl, 'HEAD'], {
+        timeout: 15000,
+        env: buildGitAuthEnv(source.provider, cleanToken, source.username || owner),
+      });
+      const branch = source.branch || getDefaultGitBranch(source.provider);
+      const branchResult = await execFileAsync('git', ['ls-remote', '--heads', remoteUrl, `refs/heads/${branch}`], {
+        timeout: 15000,
+        env: buildGitAuthEnv(source.provider, cleanToken, source.username || owner),
+      });
+      if (!branchResult.stdout.trim()) {
+        throw new Error(`Ветка "${branch}" не найдена в репозитории ${cleanRepo}. Проверьте имя ветки в настройках источника.`);
+      }
     } else if (source.provider === 'gitverse') {
       const apiRes = await fetch(`https://api.gitverse.ru/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
         headers: {
@@ -5495,10 +5601,15 @@ app.post('/api/users/bulk-action', async (req, res) => {
     }
   } else if (action === 'delete') {
     const idsToDelete = new Set(selectedUsers.map((u) => u.id));
-    const relatedExclusions = (store.exclusions || []).filter((e) => e.userId !== undefined && idsToDelete.has(e.userId));
+    const selectedTokens = new Set(selectedUsers.map((u) => u.subscriptionToken).filter(Boolean));
+    const relatedExclusions = (store.exclusions || []).filter(
+      (e) => (e.userId !== undefined && idsToDelete.has(e.userId)) || selectedTokens.has(e.token)
+    );
+    const relatedRepoFiles = (store.repoFiles || []).filter((file) => idsToDelete.has(file.userId || ''));
     const pathsToDelete = [
       ...selectedUsers.map((u) => u.gitFilePath),
       ...relatedExclusions.map((e) => e.gitFilePath),
+      ...relatedRepoFiles.map((file) => file.filePath),
     ].filter(Boolean) as string[];
 
     const deleted = await deleteActiveRepoFiles(pathsToDelete, (filePath) => `Delete user subscription ${filePath}`);
@@ -5510,7 +5621,9 @@ app.post('/api/users/bulk-action', async (req, res) => {
     if (store.repoFiles) {
       store.repoFiles = store.repoFiles.filter((f) => !pathsToDelete.includes(f.filePath));
     }
-    store.exclusions = (store.exclusions || []).filter((e) => e.userId === undefined || !idsToDelete.has(e.userId));
+    store.exclusions = (store.exclusions || []).filter(
+      (e) => !((e.userId !== undefined && idsToDelete.has(e.userId)) || selectedTokens.has(e.token))
+    );
     // Remove from store.users
     store.users = store.users.filter((u) => !idsToDelete.has(u.id));
     affectedCount = selectedUsers.length;
@@ -6918,7 +7031,7 @@ app.delete('/api/feedback/:id', (req, res) => {
 
 app.delete('/api/users/:id', async (req, res) => {
   const { id } = req.params;
-  const user = store.users.find((u) => u.id === id);
+  const user = store.users.find((u) => u.id === id || u.telegramId === Number(id));
   if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
   const deleted = await permanentlyDeleteUser(user);
   if (!deleted) {
@@ -8129,8 +8242,9 @@ app.post('/api/central-file', async (req, res) => {
   if (typeof repositoryUrl === 'string' && repositoryUrl.trim()) {
     store.centralFile.repositoryUrl = repositoryUrl.trim();
     const git = getActiveGitSource();
-    let cleanRepo = repositoryUrl.trim().replace(/^https?:\/\/[^\/]+\//, '').replace(/^\/+|\/+$/g, '');
+    let cleanRepo = repositoryPathFromInput(repositoryUrl, git.provider);
     if (cleanRepo && cleanRepo.includes('/')) {
+      if (git.repository !== cleanRepo) gitFileMetadataCache.clear();
       git.repository = cleanRepo;
     }
   }
@@ -8186,15 +8300,25 @@ app.post('/api/central-file', async (req, res) => {
 
   store.centralFile.lastUpdatedAt = new Date().toISOString();
   store.centralFile.lastCommitMessage = `Update nodes (${new Date().toLocaleTimeString('ru-RU')})`;
-  store.centralFile.isSyncedWithRepo = true;
+  store.centralFile.isSyncedWithRepo = false;
 
   saveStore();
 
-  // Push to GitVerse repo file and propagate to all subscribers asynchronously
+  // Persist edits locally before attempting the remote write so a Git outage does not lose them.
   const activeGit = getActiveGitSource();
-  if (activeGit && activeGit.token && activeGit.token.trim()) {
-    const { owner, repo } = getRepoParts(activeGit);
-    createOrUpdateGitVerseFile({
+  if (!activeGit?.token?.trim()) {
+    const stats = parseNodeStats(store.centralFile.content);
+    return res.status(409).json({
+      success: false,
+      message: 'Центральная подписка сохранена в приложении, но не отправлена в репозиторий: настройте API-токен активного Git-источника.',
+      centralFile: { ...store.centralFile, stats },
+    });
+  }
+
+  const { owner, repo } = getRepoParts(activeGit);
+  let pushResult: Awaited<ReturnType<typeof createOrUpdateGitVerseFile>>;
+  try {
+    pushResult = await createOrUpdateGitVerseFile({
       token: activeGit.token,
       owner,
       repo,
@@ -8204,27 +8328,43 @@ app.post('/api/central-file', async (req, res) => {
       commitMessage: `Update central subscription nodes at ${new Date().toLocaleTimeString('ru-RU')}`,
       provider: activeGit.provider,
       apiUrl: activeGit.apiUrl,
-    }).catch((err) => console.warn('[Central Push to GitVerse error]:', err.message));
+    });
+  } catch (err: any) {
+    pushResult = { success: false, error: err.message, rawUrl: '' };
   }
 
-  // Force propagation to in-memory store and all GitVerse subscriber files
-  const eligibleCount = store.users.filter((u) => u.hasActiveSubscription && u.status === 'active').length;
-  const exclCount = (store.exclusions || []).length;
-  syncActiveSubscribersWithCentral({ forceFullGitPush: true }).catch((e) => {
-    console.warn('[Central Sync Error]:', e.message || e);
-  });
-
   const stats = parseNodeStats(store.centralFile.content);
+  if (!pushResult.success) {
+    store.centralFile.isSyncedWithRepo = false;
+    saveStore();
+    return res.status(502).json({
+      success: false,
+      message: `Центральная подписка сохранена в приложении, но push в ${activeGit.name} не выполнен: ${pushResult.error || 'ошибка Git'}`,
+      centralFile: { ...store.centralFile, stats },
+    });
+  }
+
+  store.centralFile.isSyncedWithRepo = true;
+  if (pushResult.rawUrl) {
+    store.centralFile.centralRawUrl = pushResult.rawUrl;
+    activeGit.centralRawUrl = pushResult.rawUrl;
+  }
+  activeGit.lastSyncAt = store.centralFile.lastUpdatedAt;
+  saveStore();
+
+  const syncResult = await syncActiveSubscribersWithCentral({
+    forceFullGitPush: true,
+    backgroundGitPush: false,
+  });
+  const hasSyncErrors = syncResult.errors.length > 0;
+  const message = hasSyncErrors
+    ? `Центральный файл записан в ${activeGit.name}, но при синхронизации подписок возникло ошибок: ${syncResult.errors.length}.`
+    : `Центральный файл записан в ${activeGit.name}; обновлены подписки пользователей и исключений.`;
 
   res.json({
     success: true,
-    message: `Центральный источник сохранен! Изменения мгновенно применены ко всем подпискам (${eligibleCount} пользователей, ${exclCount} исключений).`,
-    syncResult: {
-      syncedUsers: eligibleCount,
-      syncedExclusions: exclCount,
-      durationMs: 35,
-      errors: [],
-    },
+    message,
+    syncResult,
     centralFile: {
       ...store.centralFile,
       centralRawUrl: store.centralFile.centralRawUrl || centralRawUrl,
@@ -8235,11 +8375,19 @@ app.post('/api/central-file', async (req, res) => {
 });
 
 app.post('/api/central-file/sync', async (req, res) => {
-  const { direction, centralRawUrl } = req.body;
+  const { direction, centralRawUrl, content } = req.body;
   const git = getActiveGitSource();
   const urlToPull = centralRawUrl || store.centralFile.centralRawUrl || git.centralRawUrl || buildGitRawUrl(git, store.centralFile.filename || 'L');
 
   let syncMsg = '';
+  let syncResult: CentralSyncResult | undefined;
+  if (direction === 'push' && typeof content === 'string') {
+    store.centralFile.content = content;
+    store.centralFile.lastUpdatedAt = new Date().toISOString();
+    store.centralFile.lastCommitMessage = `Update nodes (${new Date().toLocaleTimeString('ru-RU')})`;
+    store.centralFile.isSyncedWithRepo = false;
+    saveStore();
+  }
   if (direction === 'pull') {
     try {
       const resp = await fetch(urlToPull, {
@@ -8252,11 +8400,16 @@ app.post('/api/central-file/sync', async (req, res) => {
         const text = await resp.text();
         if (text && text.trim()) {
           store.centralFile.content = text;
+          store.centralFile.centralRawUrl = urlToPull;
+          store.centralFile.lastUpdatedAt = new Date().toISOString();
+          store.centralFile.isSyncedWithRepo = true;
           const stats = parseNodeStats(text);
-          syncMsg = `Конфигурация успешно загружена из центрального источника GitVerse: ${urlToPull} (${stats.total} узлов)`;
+          syncMsg = `Конфигурация загружена из ${git.name}: ${urlToPull} (${stats.total} элементов)`;
           logSystemEvent('success', 'sync', 'CENTRAL_PULLED', syncMsg, { url: urlToPull, nodes: stats.total });
-          // Sync active subscribers with the newly pulled central content
-          syncActiveSubscribersWithCentral({ forceFullGitPush: true }).catch((e) => console.warn('[Central Sync Error]:', e));
+          syncResult = await syncActiveSubscribersWithCentral({
+            forceFullGitPush: true,
+            backgroundGitPush: false,
+          });
         } else {
           syncMsg = `Источник ${urlToPull} вернул пустой ответ. Конфигурация не изменена.`;
           logSystemEvent('warning', 'gitverse', 'PULL_EMPTY', syncMsg, { url: urlToPull });
@@ -8274,6 +8427,12 @@ app.post('/api/central-file/sync', async (req, res) => {
     }
   } else {
     // Push to Git repository directly
+    if (!git.token?.trim()) {
+      return res.status(409).json({
+        success: false,
+        message: `Не настроен API-токен источника "${git.name}"`,
+      });
+    }
     const { owner, repo } = getRepoParts(git);
     const targetFile = store.centralFile.filename || 'L';
     const pushResult = await createOrUpdateGitVerseFile({
@@ -8288,11 +8447,21 @@ app.post('/api/central-file/sync', async (req, res) => {
       apiUrl: git.apiUrl,
     });
     if (pushResult.success) {
+      store.centralFile.isSyncedWithRepo = true;
+      if (pushResult.rawUrl) {
+        store.centralFile.centralRawUrl = pushResult.rawUrl;
+        git.centralRawUrl = pushResult.rawUrl;
+      }
       syncMsg = `Конфигурация успешно отправлена в репозиторий ${git.repository} (файл ${targetFile})!`;
       logSystemEvent('success', 'gitverse', 'CENTRAL_PUSHED', syncMsg, { targetFile, repository: git.repository });
-      syncActiveSubscribersWithCentral({ forceFullGitPush: true }).catch((e) => console.warn('[Central Sync Error]:', e));
+      syncResult = await syncActiveSubscribersWithCentral({
+        forceFullGitPush: true,
+        backgroundGitPush: false,
+      });
     } else {
       syncMsg = `Ошибка коммита в репозиторий GitVerse: ${pushResult.error || 'Проверьте токен доступа'}`;
+      store.centralFile.isSyncedWithRepo = false;
+      saveStore();
       logSystemEvent('error', 'gitverse', 'CENTRAL_PUSH_FAILED', syncMsg, { error: pushResult.error, targetFile });
       return res.status(400).json({
         success: false,
@@ -8310,12 +8479,24 @@ app.post('/api/central-file/sync', async (req, res) => {
   git.lastSyncAt = store.centralFile.lastUpdatedAt;
   saveStore();
 
+  if (syncResult?.errors.length) {
+    return res.status(502).json({
+      success: false,
+      message: `${syncMsg} Не удалось обновить ${syncResult.errors.length} файлов подписок: ${syncResult.errors.slice(0, 3).join('; ')}`,
+      syncedAt: store.centralFile.lastUpdatedAt,
+      stats: parseNodeStats(store.centralFile.content),
+      content: store.centralFile.content,
+      syncResult,
+    });
+  }
+
   res.json({
     success: true,
     message: syncMsg,
     syncedAt: store.centralFile.lastUpdatedAt,
     stats: parseNodeStats(store.centralFile.content),
     content: store.centralFile.content,
+    syncResult,
   });
 });
 

@@ -215,17 +215,20 @@ export default function App() {
     const res = await saveCentralFile(payload);
     if (res.centralFile) {
       setCentralFile(res.centralFile);
+      lastSyncedContentRef.current = res.centralFile.content;
     }
     await loadAllData();
+    return res;
   };
 
-  const handleSyncGit = async (direction: 'push' | 'pull', centralRawUrl?: string) => {
-    const res = await syncCentralFileWithGit(direction, centralRawUrl);
+  const handleSyncGit = async (direction: 'push' | 'pull', centralRawUrl?: string, content?: string) => {
+    const res = await syncCentralFileWithGit(direction, centralRawUrl, content);
     if (res.content && centralFile) {
       setCentralFile({ ...centralFile, content: res.content });
       lastSyncedContentRef.current = res.content;
     }
     await loadAllData();
+    return res;
   };
 
   const handleSyncToSubscribers = async () => {

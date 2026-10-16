@@ -1630,7 +1630,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
 
               <div>
-                <label className="font-bold text-stone-700 block mb-1">API Токен / Ключ доступа *</label>
+                <label className="font-bold text-stone-700 block mb-1">API токен / ключ доступа</label>
                 <input
                   type="password"
                   value={editingGit.token || ''}
@@ -1639,6 +1639,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   className="w-full px-3 py-2 rounded-xl border border-stone-200 bg-stone-50 text-stone-900 font-mono"
                 />
               </div>
+
+              {['sourcecraft', 'gitflic', 'moshub', 'gitlab'].includes(editingGit.provider || '') && (
+                <div>
+                  <label className="font-bold text-stone-700 block mb-1">Логин для Git HTTPS</label>
+                  <input
+                    type="text"
+                    autoComplete="username"
+                    value={editingGit.username || ''}
+                    onChange={(e) => setEditingGit({ ...editingGit, username: e.target.value })}
+                    placeholder="Имя пользователя аккаунта, не namespace репозитория"
+                    className="w-full px-3 py-2 rounded-xl border border-stone-200 bg-stone-50 text-stone-900 font-mono"
+                  />
+                  <span className="text-[10px] text-stone-400">
+                    Используется вместе с токеном при git clone/push; если не заполнено, применяется логин по умолчанию провайдера.
+                  </span>
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-3">
                 <div>

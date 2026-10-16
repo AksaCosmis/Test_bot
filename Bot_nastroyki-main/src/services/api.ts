@@ -38,8 +38,11 @@ export async function saveGitSource(source: Partial<GitSourceItem>): Promise<{ s
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(source),
   });
-  if (!res.ok) throw new Error('Ошибка сохранения источника Git');
-  return res.json();
+  const data = await res.json();
+  if (!res.ok || data.success === false) {
+    throw new Error(data.message || 'Ошибка сохранения источника Git');
+  }
+  return data;
 }
 
 export async function testGitSource(id: string): Promise<{ success: boolean; message: string; source: GitSourceItem }> {
@@ -401,21 +404,29 @@ export async function fetchCentralFile(): Promise<CentralSubscriptionFile & { st
   return res.json();
 }
 
-export async function saveCentralFile(payload: Partial<CentralSubscriptionSavePayload> & { content: string }): Promise<{ success: boolean; message: string; centralFile: CentralSubscriptionFile & { stats: any } }> {
+export async function saveCentralFile(payload: Partial<CentralSubscriptionSavePayload> & { content: string }): Promise<{
+  success: boolean;
+  message: string;
+  centralFile: CentralSubscriptionFile & { stats: any };
+  syncResult?: { syncedUsers: number; syncedExclusions: number; durationMs: number; errors: string[] };
+}> {
   const res = await fetch(`${API_BASE}/central-file`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error('Ошибка сохранения подписки');
-  return res.json();
+  const data = await res.json();
+  if (!res.ok || data.success === false) {
+    throw new Error(data.message || 'Ошибка сохранения подписки');
+  }
+  return data;
 }
 
-export async function syncCentralFileWithGit(direction: 'push' | 'pull', centralRawUrl?: string): Promise<{ success: boolean; message: string; syncedAt: string; stats?: any; content?: string }> {
+export async function syncCentralFileWithGit(direction: 'push' | 'pull', centralRawUrl?: string, content?: string): Promise<{ success: boolean; message: string; syncedAt: string; stats?: any; content?: string }> {
   const res = await fetch(`${API_BASE}/central-file/sync`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ direction, centralRawUrl }),
+    body: JSON.stringify({ direction, centralRawUrl, content }),
   });
   const data = await res.json();
   if (!res.ok || data.success === false) {
@@ -1329,10 +1340,6 @@ export async function triggerManualGatewayAudit(): Promise<{
 
 // Alias for manual gateway sync pass
 export const runGatewayPass = triggerManualGatewayAudit;
-
-
-
-
 
 
 

@@ -23,8 +23,8 @@ ENV PORT=3000
 ENV AUTO_RESTART_HOURS=24
 ENV TZ=Europe/Moscow
 
-# Install curl for container healthcheck and bash for entrypoint
-RUN apk add --no-cache curl bash tzdata
+# Git is required for providers that use authenticated Git remotes.
+RUN apk add --no-cache curl bash git tzdata
 
 # Copy package files and install production dependencies
 COPY package*.json ./

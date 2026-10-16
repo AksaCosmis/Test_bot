@@ -1384,7 +1384,7 @@ export class TelegramBotManager {
         user.subscriptionStatusReason = undefined;
         this.options.saveStore();
 
-        // Resolve display key (HAPP crypt5 or clean shortened INCY)
+        // Resolve the selected HAPP crypt4 or shortened INCY display URL.
         const displayKey = await this.options.resolveUserDisplayKey(user);
         user.finalSubscriptionUrl = displayKey;
         user.finalUrl = displayKey;

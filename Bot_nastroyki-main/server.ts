@@ -2019,7 +2019,7 @@ function repositoryPathFromInput(value: string, provider: GitProvider): string {
   }
 }
 
-// Build the supported HAPP crypt5 deep link from the repository RAW URL.
+// Build a HAPP crypt4 deep link from the repository RAW URL.
 const HAPP_CRYPTO_V4_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA3UZ0M3L4K+WjM3vkbQnz
 ozHg/cRbEXvQ6i4A8RVN4OM3rK9kU01FdjyoIgywve8OEKsFnVwERZAQZ1Trv60B
@@ -2050,10 +2050,70 @@ function convertToHappCryptUrl(rawUrl: string, _token: string, _userTelegramId: 
   return buildHappCryptUrl(rawUrl);
 }
 
-// Helper: Deliver INCY link directly through the Russian relay gateway or direct backend endpoint
+// Qsen's shortener page uses this same clck.ru endpoint for URL creation.
+function isClckShortUrl(url: string | undefined): url is string {
+  return Boolean(url && /^https:\/\/clck\.ru\/[A-Za-z0-9_-]+$/i.test(url));
+}
+
+function getUserSubscriptionTargetUrl(user: any): string {
+  const token = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
+  const subscription = user.sourceSubscriptions?.find(
+    (item: any) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
+  ) || user.sourceSubscriptions?.find((item: any) => item.sourceId === user.subscriptionSourceId);
+  const source = store.gitSources?.find((item: GitSourceItem) => item.id === user.subscriptionSourceId) || getActiveGitSource();
+  const rawFileUrl = subscription?.rawUrl || user.gitRawUrl ||
+    buildGitRawUrl(source, subscription?.filePath || user.gitFilePath || `subs/${token}.txt`);
+  const gatewayActive = Boolean(
+    store.relayGatewayConfig?.enabled &&
+    store.relayGatewayConfig?.url &&
+    store.relayGatewayConfig?.isOnline === true &&
+    store.relayGatewayConfig?.lastTestStatus === 'success'
+  );
+  return gatewayActive
+    ? `${store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')}/api/sub/${token}`
+    : rawFileUrl;
+}
+
+function applyUserIncyShortUrl(user: any, targetUrl: string, shortUrl: string): void {
+  user.clckUrl = shortUrl;
+  user.clckTargetUrl = targetUrl;
+  if (user.subscriptionType === 'incy') {
+    user.finalSubscriptionUrl = shortUrl;
+    user.finalUrl = shortUrl;
+  }
+  const subscription = user.sourceSubscriptions?.find(
+    (item: any) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
+  );
+  if (subscription) subscription.finalUrl = shortUrl;
+  const repoFile = store.repoFiles?.find(
+    (item: RepoUserFile) =>
+      item.sourceId === user.subscriptionSourceId &&
+      item.filePath === user.gitFilePath
+  );
+  if (repoFile) repoFile.finalUrl = shortUrl;
+}
+
+function applyUserHappCryptUrl(user: any, targetUrl: string, happUrl: string): void {
+  user.finalSubscriptionUrl = happUrl;
+  user.finalUrl = happUrl;
+  user.clckUrl = happUrl;
+  user.clckTargetUrl = targetUrl;
+  const subscription = user.sourceSubscriptions?.find(
+    (item: any) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
+  );
+  if (subscription) subscription.finalUrl = happUrl;
+  const repoFile = store.repoFiles?.find(
+    (item: RepoUserFile) =>
+      item.sourceId === user.subscriptionSourceId &&
+      item.filePath === user.gitFilePath
+  );
+  if (repoFile) repoFile.finalUrl = happUrl;
+}
+
+// Qsen's UI posts the URL to clck.ru and returns a clck.ru short URL.
 async function shortenIncyUrl(rawUrl: string, tokenSafe?: string): Promise<string> {
   const targetUrl = rawUrl || `${getDirectAppBaseUrl()}/api/sub/${tokenSafe || 'sub'}`;
-  if (/^https:\/\/clck\.ru\/[^\s]+$/i.test(targetUrl)) return targetUrl;
+  if (isClckShortUrl(targetUrl)) return targetUrl;
 
   try {
     const params = new URLSearchParams({ url: targetUrl });
@@ -2062,54 +2122,30 @@ async function shortenIncyUrl(rawUrl: string, tokenSafe?: string): Promise<strin
       signal: AbortSignal.timeout(10000),
     });
     const shortUrl = (await response.text()).trim();
-    if (response.ok && /^https:\/\/clck\.ru\/[^\s]+$/i.test(shortUrl)) return shortUrl;
-    throw new Error(`clck.ru вернул неподходящий ответ (HTTP ${response.status})`);
+    if (response.ok && isClckShortUrl(shortUrl)) return shortUrl;
+    throw new Error(`Сервис сокращения вернул неподходящий ответ (HTTP ${response.status}): ${shortUrl.slice(0, 200)}`);
   } catch (err: any) {
-    console.warn('[clck.ru shortener warning]:', err.message);
-    throw new Error(`Не удалось сократить INCY-ссылку через clck.ru: ${err.message}`);
+    console.warn('[Qsen/clck.ru shortener warning]:', err.message);
+    throw new Error(`Не удалось сократить INCY-ссылку через Qsen/clck.ru: ${err.message}`);
   }
 }
 
-// Helper: Resolve subscription display key for bot profile and messages
-// Guarantees:
-// 1. If format is 'happ', link is crypt5 ('happ://crypt5/...=ff') encrypting working Base64 endpoint
-// 2. If format is 'incy', link is direct high-speed Base64 endpoint (imported seamlessly by Incy)
-// 3. Updates user.finalSubscriptionUrl, finalUrl, clckUrl in store
+// Resolve and persist the display URL for the selected subscription format.
 async function resolveUserDisplayKey(user: any): Promise<string> {
   const isHapp = user.subscriptionType === 'happ';
   const token = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
-  const subscription = user.sourceSubscriptions?.find(
-    (item: any) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
-  ) || user.sourceSubscriptions?.find((item: any) => item.sourceId === user.subscriptionSourceId);
-  const source = store.gitSources?.find((item: GitSourceItem) => item.id === user.subscriptionSourceId) || getActiveGitSource();
-  const rawFileUrl = subscription?.rawUrl || user.gitRawUrl || buildGitRawUrl(source, subscription?.filePath || user.gitFilePath || `subs/${token}.txt`);
-
-  const gatewayActive = Boolean(
-    store.relayGatewayConfig?.enabled &&
-    store.relayGatewayConfig?.url &&
-    store.relayGatewayConfig?.isOnline === true &&
-    store.relayGatewayConfig?.lastTestStatus === 'success'
-  );
-  const targetBaseUrl = gatewayActive
-    ? `${store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')}/api/sub/${token}`
-    : rawFileUrl;
+  const targetBaseUrl = getUserSubscriptionTargetUrl(user);
 
   if (isHapp) {
     const happUrl = buildHappCryptUrl(targetBaseUrl);
-    user.finalSubscriptionUrl = happUrl;
-    user.finalUrl = happUrl;
-    user.clckUrl = happUrl;
-    user.clckTargetUrl = targetBaseUrl;
+    applyUserHappCryptUrl(user, targetBaseUrl, happUrl);
     saveStore();
     return happUrl;
   } else {
-    const incyUrl = user.clckTargetUrl === targetBaseUrl && /^https:\/\/clck\.ru\//i.test(user.clckUrl || '')
+    const incyUrl = user.clckTargetUrl === targetBaseUrl && isClckShortUrl(user.clckUrl)
       ? user.clckUrl
       : await shortenIncyUrl(targetBaseUrl, token);
-    user.finalSubscriptionUrl = incyUrl;
-    user.finalUrl = incyUrl;
-    user.clckUrl = incyUrl;
-    user.clckTargetUrl = targetBaseUrl;
+    applyUserIncyShortUrl(user, targetBaseUrl, incyUrl);
     saveStore();
     return incyUrl;
   }
@@ -2811,11 +2847,17 @@ async function ensureUserRepoFile(
     ? `${store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')}/api/sub/${tokenSafe}`
     : gitRawUrl;
   if (format === 'happ') {
-    // Encrypt endpoint via crypto.happ.su -> happ://crypt5/...=ff
+    // HAPP receives a crypt4 deep link wrapping the assigned source URL.
     finalUrl = buildHappCryptUrl(targetBaseUrl);
   } else {
     // Format is INCY: direct gateway URL or direct GitVerse raw URL
     finalUrl = await shortenIncyUrl(targetBaseUrl, tokenSafe);
+  }
+  if (format === 'happ' && !finalUrl.startsWith('happ://crypt4/')) {
+    throw new Error('Не удалось сформировать HAPP-ссылку формата crypt4.');
+  }
+  if (format === 'incy' && !isClckShortUrl(finalUrl)) {
+    throw new Error('Не удалось сформировать короткую INCY-ссылку clck.ru.');
   }
 
   // Synchronize store.repoFiles pool record
@@ -3202,7 +3244,7 @@ async function applyUserUnblockAndReset(user: BotUser, preserveWarningCount = fa
   // Restore central nodes to user's GitVerse file and in-memory delivery
   await restoreUserNodes(user).catch((e) => console.warn('[Unblock restoreUserNodes error]:', e.message));
 
-  // Regenerate finalSubscriptionUrl with proper encoder (HAPP crypt5 or direct INCY gateway)
+  // Regenerate finalSubscriptionUrl with the selected HAPP or INCY format.
   await resolveUserDisplayKey(user).catch((e) => console.warn('[Unblock resolveUserDisplayKey error]:', e.message));
 
   // Reset device locks on relay gateway if enabled
@@ -5703,22 +5745,47 @@ app.delete('/api/exclusions/:id', async (req, res) => {
 });
 
 // 6. Users & Subscriptions Detailed Management
-app.get('/api/users', (req, res) => {
+app.get('/api/users', async (req, res) => {
   let migratedHappLinks = false;
+  const staleIncyUsers: BotUser[] = [];
   for (const user of store.users || []) {
-    if (user.subscriptionType !== 'happ' || user.finalSubscriptionUrl?.startsWith('happ://crypt4/')) continue;
-    const subscription = user.sourceSubscriptions?.find(
-      (item) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
-    );
-    const rawUrl = subscription?.rawUrl || user.gitRawUrl;
-    if (!rawUrl) continue;
-    const link = buildHappCryptUrl(rawUrl);
-    user.finalSubscriptionUrl = link;
-    user.finalUrl = link;
-    user.clckUrl = link;
-    user.clckTargetUrl = rawUrl;
-    migratedHappLinks = true;
+    if (
+      user.subscriptionType === 'happ' &&
+      (!user.finalSubscriptionUrl?.startsWith('happ://crypt4/') ||
+        user.clckTargetUrl !== getUserSubscriptionTargetUrl(user))
+    ) {
+      const subscription = user.sourceSubscriptions?.find(
+        (item) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
+      );
+      const rawUrl = subscription?.rawUrl || user.gitRawUrl;
+      if (rawUrl) {
+        const link = buildHappCryptUrl(rawUrl);
+        applyUserHappCryptUrl(user, rawUrl, link);
+        migratedHappLinks = true;
+      }
+    } else if (
+      user.subscriptionType === 'incy' &&
+      user.hasActiveSubscription &&
+      user.gitFilePath &&
+      (!isClckShortUrl(user.finalSubscriptionUrl) ||
+        user.clckTargetUrl !== getUserSubscriptionTargetUrl(user))
+    ) {
+      staleIncyUsers.push(user);
+    }
   }
+
+  let nextUserIndex = 0;
+  const workers = Array.from({ length: Math.min(4, staleIncyUsers.length) }, async () => {
+    while (nextUserIndex < staleIncyUsers.length) {
+      const user = staleIncyUsers[nextUserIndex++];
+      try {
+        await resolveUserDisplayKey(user);
+      } catch (err: any) {
+        console.warn(`[User INCY link migration] Failed for ${user.telegramId}:`, err.message);
+      }
+    }
+  });
+  await Promise.all(workers);
   if (migratedHappLinks) saveStore();
   res.json({ users: store.users });
 });
@@ -6096,11 +6163,13 @@ app.post('/api/users/:id/custom-subscription', async (req, res) => {
         content: fileContent,
         commitMessage: commitMsg,
       });
-      if (gitRes.rawUrl) user.gitRawUrl = gitRes.rawUrl;
+      if (gitRes.rawUrl && activeGit.id === user.subscriptionSourceId) user.gitRawUrl = gitRes.rawUrl;
       gitUpdated = gitRes.success;
 
       // Update repoFile size and nodes
-      const repoFile = store.repoFiles?.find((f) => f.filePath === user.gitFilePath);
+      const repoFile = store.repoFiles?.find(
+        (f) => f.filePath === user.gitFilePath && f.sourceId === activeGit.id
+      );
       if (repoFile) {
         repoFile.sizeBytes = Buffer.byteLength(fileContent, 'utf-8');
         repoFile.nodesFound = parseNodeStats(fileContent).total;
@@ -6108,17 +6177,29 @@ app.post('/api/users/:id/custom-subscription', async (req, res) => {
         if (gitRes.rawUrl) repoFile.rawUrl = gitRes.rawUrl;
         if (gitRes.sha) repoFile.sha = gitRes.sha;
       }
+      if (gitRes.rawUrl && activeGit.id === user.subscriptionSourceId) {
+        const subscription = user.sourceSubscriptions?.find(
+          (item) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
+        );
+        if (subscription) subscription.rawUrl = gitRes.rawUrl;
+      }
     } catch (err: any) {
       console.warn('[Custom User GitVerse sync notice]:', err.message);
     }
   }
 
-  // Update clck.ru link if user has rawUrl and needs clckUrl
-  if (user.gitRawUrl && (!user.clckUrl || !user.clckUrl.startsWith('https://clck.ru/'))) {
+  if (user.subscriptionType === 'incy') {
     try {
-      user.clckUrl = await shortenIncyUrl(user.gitRawUrl, user.subscriptionToken);
+      await resolveUserDisplayKey(user);
     } catch (e: any) {
-      console.warn('[User clck.ru notice]:', e.message);
+      console.error('[User INCY link update failed]:', e.message);
+      saveStore();
+      return res.status(502).json({
+        success: false,
+        message: 'Настройки сохранены, но не удалось обновить короткую ссылку INCY.',
+        error: e.message,
+        user,
+      });
     }
   }
 
@@ -6135,9 +6216,19 @@ app.post('/api/users/:id/shorten-clck', async (req, res) => {
   const user = store.users.find((u) => u.id === id || u.telegramId === Number(id));
   if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
 
-  const rawUrl = user.gitRawUrl || `${process.env.APP_URL || 'https://puls-access.onrender.com'}/api/sub/${user.subscriptionToken}`;
-  const shortUrl = await shortenIncyUrl(rawUrl, user.subscriptionToken);
-  user.clckUrl = shortUrl;
+  const rawUrl = getUserSubscriptionTargetUrl(user);
+  let shortUrl: string;
+  try {
+    shortUrl = await shortenIncyUrl(rawUrl, user.subscriptionToken);
+  } catch (err: any) {
+    console.error(`[User INCY manual shorten failed] ${user.telegramId}:`, err.message);
+    return res.status(502).json({
+      success: false,
+      message: 'Не удалось создать короткую INCY-ссылку.',
+      error: err.message,
+    });
+  }
+  applyUserIncyShortUrl(user, rawUrl, shortUrl);
   saveStore();
 
   res.json({ success: true, clckUrl: shortUrl, user });
@@ -11202,7 +11293,7 @@ app.post('/api/bot/simulate', async (req, res) => {
     });
   }
 
-  // Step 4: Choose Format (HAPP crypt5 vs INCY)
+  // Step 4: Choose format (HAPP crypt4 or INCY).
   if (inputCmd === 'cmd_choose_format') {
     const chooseFormatTemplate = bot.chooseFormatMessage || CANONICAL_BOT_TEMPLATES.chooseFormatMessage;
     const chooseFormatText = formatBotTemplate(chooseFormatTemplate, {
@@ -11230,7 +11321,7 @@ app.post('/api/bot/simulate', async (req, res) => {
     });
   }
 
-  // Step 5: Issue / Re-select Subscription (HAPP crypt5 or INCY)
+  // Step 5: Issue or re-select subscription in the chosen format.
   if (inputCmd === 'cmd_issue_happ' || inputCmd === 'cmd_issue_incy') {
     const isHapp = inputCmd === 'cmd_issue_happ';
     const format = isHapp ? 'happ' : 'incy';

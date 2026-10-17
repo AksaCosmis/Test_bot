@@ -2065,6 +2065,17 @@ function isClckShortUrl(url: string | undefined): url is string {
   return Boolean(url && /^https:\/\/clck\.ru\/[A-Za-z0-9_-]+$/i.test(url));
 }
 
+async function clckRedirectsTo(shortUrl: string, targetUrl: string): Promise<boolean> {
+  const response = await fetch(shortUrl, {
+    redirect: 'manual',
+    signal: AbortSignal.timeout(10000),
+  });
+  const location = response.headers.get('location');
+  await response.body?.cancel();
+  if (response.status < 300 || response.status >= 400 || !location) return false;
+  return new URL(location, shortUrl).href === new URL(targetUrl).href;
+}
+
 function getUserSubscriptionTargetUrl(user: any): string {
   const token = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
   const subscription = user.sourceSubscriptions?.find(
@@ -2131,6 +2142,94 @@ function isRepositoryRawUrl(source: GitSourceItem, rawUrl: string, filePath?: st
   } catch {
     return false;
   }
+}
+
+async function getExistingCurrentSourceSubscription(
+  user: BotUser
+): Promise<{ url: string; format: 'happ' | 'incy'; sourceName: string } | null> {
+  const source = getActiveGitSource();
+  if (
+    source.enabled === false ||
+    !source.token?.trim() ||
+    !user.hasActiveSubscription ||
+    user.pendingSubscriptionReissue
+  ) return null;
+  if (
+    user.status !== 'active' ||
+    user.isBlocked ||
+    user.isPermanentlyBanned ||
+    user.isMuted ||
+    user.detachedFromCentral
+  ) return null;
+
+  const linkedRepoFile = store.repoFiles?.find(
+    (item) =>
+      item.sourceId === source.id &&
+      (item.userId === user.id || item.telegramId === user.telegramId)
+  );
+  const subscription = user.sourceSubscriptions?.find(
+    (item) => item.sourceId === source.id && item.filePath === user.gitFilePath
+  ) || user.sourceSubscriptions?.find((item) => item.sourceId === source.id) ||
+    (user.subscriptionSourceId === source.id && user.gitFilePath
+      ? {
+          sourceId: source.id,
+          filePath: user.gitFilePath,
+          rawUrl: user.gitRawUrl || '',
+          format: user.subscriptionType === 'happ' ? 'happ' as const : 'incy' as const,
+          finalUrl: user.finalSubscriptionUrl || user.finalUrl || '',
+        }
+      : linkedRepoFile
+        ? {
+            sourceId: source.id,
+            filePath: linkedRepoFile.filePath,
+            rawUrl: linkedRepoFile.rawUrl,
+            format: linkedRepoFile.format,
+            finalUrl: linkedRepoFile.finalUrl,
+          }
+        : undefined);
+  if (!subscription?.filePath) return null;
+
+  const filePath = subscription.filePath;
+  const repoFile = store.repoFiles?.find(
+    (item) =>
+      item.sourceId === source.id &&
+      item.filePath.replace(/^\/+/, '') === filePath.replace(/^\/+/, '') &&
+      (!item.telegramId || item.telegramId === user.telegramId) &&
+      (!item.userId || item.userId === user.id)
+  );
+  const rawUrl = repoFile?.rawUrl || subscription.rawUrl;
+  const format = subscription.format;
+  const finalUrl = repoFile?.finalUrl || subscription.finalUrl;
+  if (
+    !repoFile ||
+    repoFile.isPoolFree ||
+    repoFile.isAccessible === false ||
+    !repoFile.contentHash ||
+    repoFile.contentHash !== crypto.createHash('sha256').update(getUserRepoSubscriptionContent(user)).digest('hex') ||
+    (format !== 'happ' && format !== 'incy') ||
+    !isRepositoryRawUrl(source, rawUrl, filePath) ||
+    (format === 'happ' && !isHappUrlForVersion(finalUrl, store.happCryptVersion)) ||
+    (format === 'incy' && !isClckShortUrl(finalUrl))
+  ) return null;
+
+  const response = await fetch(rawUrl, { signal: AbortSignal.timeout(12000) });
+  if (!response.ok) return null;
+  const remoteContent = await response.text();
+  if (crypto.createHash('sha256').update(remoteContent).digest('hex') !== repoFile.contentHash) return null;
+  if (format === 'incy' && !(await clckRedirectsTo(finalUrl, rawUrl))) return null;
+
+  user.subscriptionSourceId = source.id;
+  user.gitFilePath = filePath;
+  user.gitRawUrl = rawUrl;
+  user.subscriptionType = format;
+  user.subscriptionName = format === 'happ' ? `HAPP (${store.happCryptVersion})` : 'INCY';
+  user.finalSubscriptionUrl = finalUrl;
+  user.finalUrl = finalUrl;
+  user.clckUrl = finalUrl;
+  user.clckTargetUrl = rawUrl;
+  saveStore();
+
+  return { url: finalUrl, format, sourceName: source.name };
 }
 
 function applyUserIncyShortUrl(user: any, targetUrl: string, shortUrl: string): void {
@@ -3009,9 +3108,15 @@ async function ensureUserRepoFile(
   const tokenSafe = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
 
   if (!Array.isArray(user.sourceSubscriptions)) user.sourceSubscriptions = [];
+  const linkedRepoFile = store.repoFiles?.find(
+    (file) =>
+      file.sourceId === activeGit.id &&
+      (file.userId === user.id || file.telegramId === user.telegramId)
+  );
   const sourceSubscription = user.sourceSubscriptions.find(
     (subscription) => subscription.sourceId === activeGit.id && subscription.filePath === user.gitFilePath
-  ) || user.sourceSubscriptions.find((subscription) => subscription.sourceId === activeGit.id);
+  ) || user.sourceSubscriptions.find((subscription) => subscription.sourceId === activeGit.id) ||
+    (linkedRepoFile ? { sourceId: activeGit.id, filePath: linkedRepoFile.filePath } : undefined);
   const safeSourceId = activeGit.id.replace(/[^a-zA-Z0-9_-]/g, '_');
   const filePath = forceNewFile
     ? `subs/${tokenSafe}_${safeSourceId}_${Date.now()}.txt`
@@ -4544,6 +4649,7 @@ export const botManager = new TelegramBotManager({
   getBots: () => store.bots || [],
   getStore: () => store,
   saveStore,
+  getExistingCurrentSourceSubscription,
   ensureUserRepoFile,
   deleteUserRepoFile,
   resolveUserDisplayKey,
@@ -11614,7 +11720,7 @@ app.post('/api/bot/simulate', async (req, res) => {
             { text: '📋 Инструкция', callbackData: 'cmd_instructions' },
             { text: '📝 Сменить устройство', callbackData: 'cmd_request_unbind', color: 'amber' },
           ],
-          [{ text: '🌐 Получить подписку из текущего источника', callbackData: 'cmd_choose_format' }],
+          [{ text: '🌐 Получить подписку из текущего источника', callbackData: 'cmd_current_source_subscription' }],
           [{ text: '🛠 Подписка не работает — перевыпустить', callbackData: 'cmd_report_broken_subscription' }],
           [{ text: '💬 Поддержка', callbackData: 'open_admin', url: bot.adminContactUrl || 'https://t.me/puls_admin' }],
         ]
@@ -11699,6 +11805,88 @@ app.post('/api/bot/simulate', async (req, res) => {
         ],
       },
     });
+  }
+
+  if (inputCmd === 'cmd_current_source_subscription') {
+    const channelCheck = await botManager.checkAllRequiredChannels(bot, dbUser.telegramId);
+    const hasRequiredChannels = (bot.channels || []).some((channel: any) => channel.isRequired && channel.id);
+    const cannotVerifyRequiredChannels = hasRequiredChannels &&
+      (channelCheck.botNeedsAdminIn.length > 0 || channelCheck.errors.length > 0);
+    if (!channelCheck.allSubscribed || cannotVerifyRequiredChannels) {
+      if (channelCheck.missingChannels.length > 0) dbUser.channelMembership = 'left';
+      saveStore();
+      return res.json({
+        response: {
+          text: cannotVerifyRequiredChannels
+            ? '⚠️ Не удалось проверить обязательные каналы. Доступ не выдан, чтобы не обойти правило подписки. Проверьте права бота и попробуйте снова.'
+            : '❌ Чтобы получить подписку, сначала подпишитесь на все обязательные каналы и нажмите «Проверить доступ».',
+          stepKey: 'channel_notice',
+          buttons: [
+            ...channelCheck.missingChannels.map((channel: any) => [{
+              text: `📢 Подписаться на ${channel.title || channel.id}`,
+              callbackData: 'open_ch',
+              url: channel.inviteLink || `https://t.me/${channel.id.replace(/^@+/, '')}`,
+            }]),
+            [{ text: '🔄 Проверить доступ', callbackData: 'cmd_verify_channel' }],
+          ],
+        },
+      });
+    }
+
+    if (
+      dbUser.status !== 'active' ||
+      dbUser.isMuted ||
+      dbUser.isBlocked ||
+      dbUser.isPermanentlyBanned ||
+      dbUser.detachedFromCentral
+    ) {
+      return res.json({
+        response: {
+          text: '⛔ Подписка сейчас приостановлена и не получает обновления из центрального источника. Сначала нажмите «Проверить доступ» или обратитесь в поддержку.',
+          stepKey: 'channel_notice',
+          buttons: [
+            [{ text: '🔄 Проверить доступ', callbackData: 'cmd_verify_channel' }],
+            [{ text: '💬 Поддержка', callbackData: 'open_admin', url: bot.adminContactUrl || 'https://t.me/puls_admin' }],
+          ],
+        },
+      });
+    }
+
+    try {
+      const existingSubscription = await getExistingCurrentSourceSubscription(dbUser);
+      if (existingSubscription) {
+        const formatName = existingSubscription.format === 'happ'
+          ? `HAPP (${store.happCryptVersion})`
+          : 'INCY';
+        return res.json({
+          response: {
+            text:
+              `✅ Ваша действующая подписка из текущего источника «${existingSubscription.sourceName}» уже синхронизирована с центральным источником.\n\n` +
+              `Формат: ${formatName}\n\n${existingSubscription.url}`,
+            copyableText: existingSubscription.url,
+            qrData: bot.showQrCode !== false ? existingSubscription.url : undefined,
+            stepKey: 'sub_issued',
+            buttons: [
+              [
+                { text: '👤 Мой профиль', callbackData: 'cmd_profile' },
+                { text: '📋 Инструкция', callbackData: 'cmd_instructions' },
+              ],
+              [{ text: '🛠 Подписка не работает — перевыпустить', callbackData: 'cmd_report_broken_subscription' }],
+              [{ text: '⬅️ Главное меню', callbackData: 'cmd_menu' }],
+            ],
+          },
+        });
+      }
+    } catch (err: any) {
+      console.error(`[Current source subscription check failed for ${dbUser.telegramId}]:`, err.message);
+      return res.status(502).json({
+        success: false,
+        message: 'Не удалось проверить файл подписки в текущем источнике. Новая ссылка не создана.',
+        response: {
+          text: '⚠️ Не удалось проверить файл подписки в текущем источнике. Новая ссылка не создана. Попробуйте позже или обратитесь в поддержку.',
+        },
+      });
+    }
   }
 
   // Step 3: Funnel Start -> Channel Check (Проверка подписки на каналы)
@@ -11824,6 +12012,50 @@ app.post('/api/bot/simulate', async (req, res) => {
 
   // Step 5: Issue or re-select subscription in the chosen format.
   if (inputCmd === 'cmd_issue_happ' || inputCmd === 'cmd_issue_incy') {
+    const channelCheck = await botManager.checkAllRequiredChannels(bot, dbUser.telegramId);
+    const hasRequiredChannels = (bot.channels || []).some((channel: any) => channel.isRequired && channel.id);
+    const cannotVerifyRequiredChannels = hasRequiredChannels &&
+      (channelCheck.botNeedsAdminIn.length > 0 || channelCheck.errors.length > 0);
+    if (!channelCheck.allSubscribed || cannotVerifyRequiredChannels) {
+      if (channelCheck.missingChannels.length > 0) dbUser.channelMembership = 'left';
+      saveStore();
+      return res.json({
+        response: {
+          text: cannotVerifyRequiredChannels
+            ? '⚠️ Не удалось проверить обязательные каналы. Доступ не выдан, чтобы не обойти правило подписки. Проверьте права бота и попробуйте снова.'
+            : '❌ Бот не может выдать подписку, так как вы не подписаны на обязательные каналы. Подпишитесь и нажмите «Проверить доступ».',
+          stepKey: 'channel_notice',
+          buttons: [
+            ...channelCheck.missingChannels.map((channel: any) => [{
+              text: `📢 Подписаться на ${channel.title || channel.id}`,
+              callbackData: 'open_ch',
+              url: channel.inviteLink || `https://t.me/${channel.id.replace(/^@+/, '')}`,
+            }]),
+            [{ text: '🔄 Проверить доступ', callbackData: 'cmd_verify_channel' }],
+          ],
+        },
+      });
+    }
+
+    if (
+      dbUser.status !== 'active' ||
+      dbUser.isMuted ||
+      dbUser.isBlocked ||
+      dbUser.isPermanentlyBanned ||
+      dbUser.detachedFromCentral
+    ) {
+      return res.json({
+        response: {
+          text: '⛔ Подписка сейчас приостановлена и не получает обновления из центрального источника. Сначала нажмите «Проверить доступ» или обратитесь в поддержку.',
+          stepKey: 'channel_notice',
+          buttons: [
+            [{ text: '🔄 Проверить доступ', callbackData: 'cmd_verify_channel' }],
+            [{ text: '💬 Поддержка', callbackData: 'open_admin', url: bot.adminContactUrl || 'https://t.me/puls_admin' }],
+          ],
+        },
+      });
+    }
+
     const isHapp = inputCmd === 'cmd_issue_happ';
     const format = isHapp ? 'happ' : 'incy';
     const isReissue = dbUser.pendingSubscriptionReissue === true;
@@ -11931,7 +12163,7 @@ app.post('/api/bot/simulate', async (req, res) => {
             { text: '👤 Мой профиль', callbackData: 'cmd_profile', color: 'emerald' },
             { text: '📝 Сменить устройство', callbackData: 'cmd_request_unbind', color: 'amber' },
           ],
-          [{ text: '🌐 Получить подписку из текущего источника', callbackData: 'cmd_choose_format' }],
+          [{ text: '🌐 Получить подписку из текущего источника', callbackData: 'cmd_current_source_subscription' }],
           [{ text: '🛠 Подписка не работает — перевыпустить', callbackData: 'cmd_report_broken_subscription' }],
           [{ text: '⬅️ Главное меню', callbackData: 'cmd_menu' }],
         ],

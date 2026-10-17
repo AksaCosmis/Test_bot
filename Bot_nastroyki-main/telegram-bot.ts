@@ -11,6 +11,7 @@ export interface TelegramBotManagerOptions {
   getBots: () => any[];
   getStore: () => any;
   saveStore: () => void;
+  getExistingCurrentSourceSubscription: (user: any) => Promise<{ url: string; format: 'happ' | 'incy'; sourceName: string } | null>;
   ensureUserRepoFile: (user: any, format: 'happ' | 'incy', forceNewFile?: boolean) => Promise<{ filePath: string; rawUrl: string; finalUrl: string }>;
   deleteUserRepoFile: (sourceId: string, filePath: string) => Promise<boolean>;
   resolveUserDisplayKey: (user: any) => Promise<string>;
@@ -1324,9 +1325,14 @@ export class TelegramBotManager {
     }
 
     // Format selection screen
-    if (data === 'cmd_choose_format' || data === 'cmd_get_sub') {
+    if (data === 'cmd_choose_format' || data === 'cmd_get_sub' || data === 'cmd_current_source_subscription') {
       const channelCheck = await this.checkAllRequiredChannels(bot, cq.from.id);
-      if (!channelCheck.allSubscribed) {
+      const hasRequiredChannels = (bot.channels || []).some((channel: any) => channel.isRequired && channel.id);
+      const cannotVerifyRequiredChannels = hasRequiredChannels &&
+        (channelCheck.botNeedsAdminIn.length > 0 || channelCheck.errors.length > 0);
+      if (!channelCheck.allSubscribed || cannotVerifyRequiredChannels) {
+        if (channelCheck.missingChannels.length > 0) user.channelMembership = 'left';
+        this.options.saveStore();
         const buttons: any[] = channelCheck.missingChannels.map((c: any) => [
           {
             text: `📢 Подписаться на ${c.title || c.id}`,
@@ -1344,14 +1350,74 @@ export class TelegramBotManager {
         await this.tgApi(bot.token, 'sendMessage', {
           chat_id: chatId,
           text:
-            `📢 <b>Перед получением подписки необходимо подписаться на наши обязательные каналы!</b>\n\n` +
-            `Подпишитесь по ссылкам ниже и нажмите «Проверить доступ»:${adminNotice}`,
+            `${cannotVerifyRequiredChannels
+              ? '⚠️ <b>Не удалось проверить обязательные каналы.</b>\n\nДоступ не выдан, чтобы не обойти правило подписки.'
+              : '📢 <b>Перед получением подписки необходимо подписаться на наши обязательные каналы!</b>\n\nПодпишитесь по ссылкам ниже и нажмите «Проверить доступ»:'}${adminNotice}`,
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: buttons,
           },
         });
         return;
+      }
+
+      if (data === 'cmd_current_source_subscription') {
+        if (
+          user.status !== 'active' ||
+          user.isMuted ||
+          user.isBlocked ||
+          user.isPermanentlyBanned ||
+          user.detachedFromCentral
+        ) {
+          await this.tgApi(bot.token, 'sendMessage', {
+            chat_id: chatId,
+            text: '⛔ Подписка сейчас приостановлена и не получает обновления из центрального источника. Сначала восстановите доступ через «Проверить доступ» или обратитесь в поддержку.',
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🔄 Проверить доступ', callback_data: 'cmd_verify_channel' }],
+                [{ text: '💬 Поддержка', url: bot.adminContactUrl || 'https://t.me/puls_admin' }],
+              ],
+            },
+          });
+          return;
+        }
+
+        let existingSubscription: Awaited<ReturnType<TelegramBotManagerOptions['getExistingCurrentSourceSubscription']>>;
+        try {
+          existingSubscription = await this.options.getExistingCurrentSourceSubscription(user);
+        } catch (err: any) {
+          console.error(`[Current source subscription check failed for ${user.telegramId}]:`, err.message);
+          await this.tgApi(bot.token, 'sendMessage', {
+            chat_id: chatId,
+            text: '⚠️ Не удалось проверить файл подписки в текущем источнике. Новая ссылка не создана. Попробуйте позже или обратитесь в поддержку.',
+            parse_mode: 'HTML',
+          });
+          return;
+        }
+        if (existingSubscription) {
+          const formatName = existingSubscription.format === 'happ'
+            ? `HAPP (${store.happCryptVersion || 'crypt4'})`
+            : 'INCY';
+          await this.tgApi(bot.token, 'sendMessage', {
+            chat_id: chatId,
+            text:
+              `✅ <b>Ваша действующая подписка из текущего источника</b> «${escapeHtml(existingSubscription.sourceName)}» уже синхронизирована с центральным источником.\n\n` +
+              `Формат: <b>${formatName}</b>\n\n<code>${escapeHtml(existingSubscription.url)}</code>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: '👤 Мой профиль', callback_data: 'cmd_profile' },
+                  { text: '📋 Инструкция', callback_data: 'cmd_instructions' },
+                ],
+                [{ text: '🛠 Подписка не работает — перевыпустить', callback_data: 'cmd_report_broken_subscription' }],
+                [{ text: '◀️ Главное меню', callback_data: 'cmd_menu' }],
+              ],
+            },
+          });
+          return;
+        }
       }
 
       await this.sendFormatSelection(bot, chatId);
@@ -1362,7 +1428,12 @@ export class TelegramBotManager {
     if (data === 'cmd_issue_happ' || data === 'cmd_issue_incy') {
       // 1. Strict channel verification before issuing!
       const channelCheck = await this.checkAllRequiredChannels(bot, cq.from.id);
-      if (!channelCheck.allSubscribed) {
+      const hasRequiredChannels = (bot.channels || []).some((channel: any) => channel.isRequired && channel.id);
+      const cannotVerifyRequiredChannels = hasRequiredChannels &&
+        (channelCheck.botNeedsAdminIn.length > 0 || channelCheck.errors.length > 0);
+      if (!channelCheck.allSubscribed || cannotVerifyRequiredChannels) {
+        if (channelCheck.missingChannels.length > 0) user.channelMembership = 'left';
+        this.options.saveStore();
         const buttons: any[] = channelCheck.missingChannels.map((c: any) => [
           {
             text: `📢 Подписаться на ${c.title || c.id}`,
@@ -1373,12 +1444,33 @@ export class TelegramBotManager {
 
         await this.tgApi(bot.token, 'sendMessage', {
           chat_id: chatId,
-          text:
-            `❌ <b>Бот не может выдать подписку, так как вы не подписаны на обязательные каналы!</b>\n\n` +
-            `Пожалуйста, подпишитесь на указанные каналы и нажмите «Проверить доступ»:`,
+          text: cannotVerifyRequiredChannels
+            ? '⚠️ <b>Не удалось проверить обязательные каналы.</b>\n\nДоступ не выдан, чтобы не обойти правило подписки. Проверьте права бота и попробуйте снова.'
+            : '❌ <b>Бот не может выдать подписку, так как вы не подписаны на обязательные каналы!</b>\n\nПожалуйста, подпишитесь на указанные каналы и нажмите «Проверить доступ»:',
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: buttons,
+          },
+        });
+        return;
+      }
+
+      if (
+        user.status !== 'active' ||
+        user.isMuted ||
+        user.isBlocked ||
+        user.isPermanentlyBanned ||
+        user.detachedFromCentral
+      ) {
+        await this.tgApi(bot.token, 'sendMessage', {
+          chat_id: chatId,
+          text: '⛔ Подписка сейчас приостановлена и не получает обновления из центрального источника. Сначала восстановите доступ через «Проверить доступ» или обратитесь в поддержку.',
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🔄 Проверить доступ', callback_data: 'cmd_verify_channel' }],
+              [{ text: '💬 Поддержка', url: bot.adminContactUrl || 'https://t.me/puls_admin' }],
+            ],
           },
         });
         return;
@@ -1515,7 +1607,7 @@ export class TelegramBotManager {
                 { text: '👤 Мой профиль', callback_data: 'cmd_profile' },
                 { text: '📝 Сменить устройство', callback_data: 'cmd_request_unbind' },
               ],
-              [{ text: '🌐 Получить подписку из текущего источника', callback_data: 'cmd_choose_format' }],
+              [{ text: '🌐 Получить подписку из текущего источника', callback_data: 'cmd_current_source_subscription' }],
               [{ text: '◀️ Главное меню', callback_data: 'cmd_menu' }],
             ],
           },
@@ -1841,7 +1933,7 @@ export class TelegramBotManager {
               { text: '📋 Инструкция', callback_data: 'cmd_instructions' },
               { text: '📝 Сменить устройство', callback_data: 'cmd_request_unbind' },
             ],
-            [{ text: '🌐 Получить подписку из текущего источника', callback_data: 'cmd_choose_format' }],
+            [{ text: '🌐 Получить подписку из текущего источника', callback_data: 'cmd_current_source_subscription' }],
             [{ text: '💬 Поддержка', url: bot.adminContactUrl || 'https://t.me/puls_admin' }],
           ],
         },

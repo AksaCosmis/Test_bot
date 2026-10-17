@@ -2136,6 +2136,75 @@ function applyUserHappCryptUrl(
   if (repoFile) repoFile.finalUrl = happUrl;
 }
 
+async function refreshUserSubscriptionLink(
+  user: BotUser,
+  sourceId: string,
+  filePath: string,
+  rawUrl: string,
+  format: 'happ' | 'incy'
+): Promise<string> {
+  const token = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
+  const gatewayActive = Boolean(
+    store.relayGatewayConfig?.enabled &&
+    store.relayGatewayConfig?.url &&
+    store.relayGatewayConfig?.isOnline === true &&
+    store.relayGatewayConfig?.lastTestStatus === 'success'
+  );
+  const targetUrl = gatewayActive
+    ? `${store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')}/api/sub/${token}`
+    : rawUrl;
+
+  user.subscriptionSourceId = sourceId;
+  user.gitFilePath = filePath;
+  user.gitRawUrl = rawUrl;
+  if (!Array.isArray(user.sourceSubscriptions)) user.sourceSubscriptions = [];
+  let subscription = user.sourceSubscriptions.find(
+    (item) => item.sourceId === sourceId && item.filePath === filePath
+  );
+  if (!subscription) {
+    subscription = {
+      sourceId,
+      filePath,
+      rawUrl,
+      format,
+      finalUrl: '',
+      updatedAt: new Date().toISOString(),
+    };
+    user.sourceSubscriptions.push(subscription);
+  }
+  subscription.rawUrl = rawUrl;
+  subscription.format = format;
+  subscription.updatedAt = new Date().toISOString();
+
+  let finalUrl: string;
+  if (format === 'happ') {
+    finalUrl = buildHappCryptUrl(targetUrl);
+    if (!isHappUrlForVersion(finalUrl, store.happCryptVersion)) {
+      throw new Error(`Не удалось обновить HAPP-ссылку формата ${store.happCryptVersion}.`);
+    }
+    applyUserHappCryptUrl(user, targetUrl, finalUrl);
+  } else {
+    finalUrl = user.clckTargetUrl === targetUrl && isClckShortUrl(user.clckUrl)
+      ? user.clckUrl
+      : await shortenIncyUrl(targetUrl, token);
+    if (!isClckShortUrl(finalUrl)) {
+      throw new Error('Не удалось обновить короткую INCY-ссылку clck.ru.');
+    }
+    applyUserIncyShortUrl(user, targetUrl, finalUrl);
+    user.finalSubscriptionUrl = finalUrl;
+    user.finalUrl = finalUrl;
+    user.clckUrl = finalUrl;
+    user.clckTargetUrl = targetUrl;
+  }
+  subscription.finalUrl = finalUrl;
+
+  const repoFile = store.repoFiles?.find(
+    (item) => item.sourceId === sourceId && item.filePath === filePath
+  );
+  if (repoFile) repoFile.finalUrl = finalUrl;
+  return finalUrl;
+}
+
 function migrateHappLinks(version: HappCryptVersion): number {
   let updatedCount = 0;
   for (const user of store.users || []) {
@@ -3723,15 +3792,39 @@ async function syncActiveSubscribersWithCentral(options?: {
               remoteShaMap.set(filenameOnly, gitRes.sha);
             }
 
+            const updatedRawUrl = gitRes.rawUrl || buildGitRawUrl(activeGit, filePath);
+            if (repoFile && updatedRawUrl) repoFile.rawUrl = updatedRawUrl;
             for (const u of item.users) {
-              if (gitRes.rawUrl) u.gitRawUrl = gitRes.rawUrl;
-              const subscription = u.sourceSubscriptions?.find((entry) => entry.sourceId === activeGit.id && entry.filePath === filePath);
-              if (subscription && gitRes.rawUrl) subscription.rawUrl = gitRes.rawUrl;
-              if (subscription) subscription.updatedAt = new Date().toISOString();
-              u.lastActiveAt = new Date().toISOString();
-              u.syncHealthStatus = 'green';
-              u.isInconsistent = false;
-              u.inconsistencyReason = undefined;
+              try {
+                if (!updatedRawUrl) {
+                  throw new Error(`Источник «${activeGit.name}» не вернул URL файла ${filePath}`);
+                }
+                await refreshUserSubscriptionLink(
+                  u,
+                  activeGit.id,
+                  filePath,
+                  updatedRawUrl,
+                  u.subscriptionType === 'happ' ? 'happ' : 'incy'
+                );
+                u.lastActiveAt = new Date().toISOString();
+                u.syncHealthStatus = 'green';
+                u.isInconsistent = false;
+                u.inconsistencyReason = undefined;
+              } catch (linkError: any) {
+                const message = `User ${u.telegramId}: файл ${filePath} обновлен, но ссылка подписки не обновилась: ${linkError.message}`;
+                errors.push(message);
+                u.syncHealthStatus = 'red';
+                u.isInconsistent = true;
+                u.inconsistencyReason = 'Файл обновлен, но ссылка подписки не обновилась';
+                logSystemEvent('error', 'sync', 'SUBSCRIPTION_LINK_UPDATE_FAILED', message, {
+                  telegramId: u.telegramId,
+                  sourceId: activeGit.id,
+                  filePath,
+                });
+              }
+            }
+            if (item.users.some((u) => u.isInconsistent && u.inconsistencyReason === 'Файл обновлен, но ссылка подписки не обновилась')) {
+              if (repoFile) repoFile.contentHash = '';
             }
             for (const e of item.exclusions) {
               if (gitRes.rawUrl) e.gitRawUrl = gitRes.rawUrl;
@@ -4095,75 +4188,109 @@ function computeSyncHealthReport() {
 // Force re-sync a specific subscriber with central source
 async function forceResyncSubscriber(user: BotUser): Promise<{ success: boolean; message: string; user: BotUser; nodesCount: number }> {
   const activeGit = getActiveGitSource();
+  const targetGit = store.gitSources?.find((source) => source.id === user.subscriptionSourceId) || activeGit;
   const format = user.subscriptionType === 'happ' ? 'happ' : 'incy';
-
-  if (!user.gitFilePath) {
-    const alloc = await ensureUserRepoFile(user, format);
-    user.gitFilePath = alloc.filePath;
-    user.gitRawUrl = alloc.rawUrl;
-    user.finalSubscriptionUrl = alloc.finalUrl;
-  }
-
+  const tokenSafe = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
+  const sourceSubscription = user.sourceSubscriptions?.find(
+    (subscription) => subscription.sourceId === targetGit.id && subscription.filePath === user.gitFilePath
+  ) || user.sourceSubscriptions?.find((subscription) => subscription.sourceId === targetGit.id);
+  const safeSourceId = targetGit.id.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const filePath = sourceSubscription?.filePath ||
+    (user.subscriptionSourceId === targetGit.id || !user.subscriptionSourceId ? user.gitFilePath : undefined) ||
+    (user.sourceSubscriptions?.length ? `subs/${tokenSafe}_${safeSourceId}.txt` : `subs/${tokenSafe}.txt`);
   const content = getUserRepoSubscriptionContent(user);
   const stats = parseNodeStats(content);
   const sizeBytes = Buffer.byteLength(content, 'utf-8');
-
-  if (activeGit.token && activeGit.token.trim() && user.gitFilePath) {
-    const { owner, repo } = getRepoParts(activeGit);
-    const branch = activeGit.branch || getDefaultGitBranch(activeGit.provider);
-    const commitMsg = `Force reconcile: sync central nodes to ${user.gitFilePath} for @${user.username || user.telegramId}`;
-    const contentHash = crypto.createHash('sha256').update(content).digest('hex');
-    try {
-      const gitRes = await createOrUpdateGitVerseFile({
-        token: activeGit.token.trim(),
-        owner,
-        repo,
-        branch,
-        filePath: user.gitFilePath,
-        content,
-        commitMessage: commitMsg,
-      });
-      if (gitRes.rawUrl) {
-        user.gitRawUrl = gitRes.rawUrl;
-      }
-      if (gitRes.sha) {
-        gitFileMetadataCache.set(user.gitFilePath.replace(/^\/+/, ''), {
-          sha: gitRes.sha,
-          contentHash,
-          rawUrl: gitRes.rawUrl,
-          lastUpdated: Date.now(),
-        });
-      }
-    } catch (gitErr: any) {
-      console.warn(`[Force Resync] Git commit warning for ${user.gitFilePath}:`, gitErr.message);
-    }
+  if (!targetGit.token?.trim()) {
+    throw new Error(`Не настроен токен для Git-источника «${targetGit.name}»`);
   }
 
+  const { owner, repo } = getRepoParts(targetGit);
+  const branch = targetGit.branch || getDefaultGitBranch(targetGit.provider);
   const contentHash = crypto.createHash('sha256').update(content).digest('hex');
-  if (user.gitFilePath) {
-    if (!store.repoFiles) store.repoFiles = [];
-    let repoFile = store.repoFiles.find((f) => f.filePath === user.gitFilePath);
-    if (!repoFile) {
-      repoFile = {
-        filePath: user.gitFilePath,
-        rawUrl: user.gitRawUrl || '',
-        format,
-        finalUrl: user.finalSubscriptionUrl || '',
-        sizeBytes,
-        nodesFound: stats.total,
-        isPoolFree: false,
-        updatedAt: new Date().toISOString(),
-        contentHash,
-      };
-      store.repoFiles.push(repoFile);
-    } else {
-      repoFile.nodesFound = stats.total;
-      repoFile.sizeBytes = sizeBytes;
-      repoFile.updatedAt = new Date().toISOString();
-      repoFile.contentHash = contentHash;
-      if (user.gitRawUrl) repoFile.rawUrl = user.gitRawUrl;
-    }
+  const gitRes = await createOrUpdateGitVerseFile({
+    token: targetGit.token.trim(),
+    owner,
+    repo,
+    branch,
+    filePath,
+    content,
+    commitMessage: `Force reconcile: sync central nodes to ${filePath} for @${user.username || user.telegramId}`,
+    provider: targetGit.provider,
+    apiUrl: targetGit.apiUrl,
+  });
+  if (!gitRes.success) {
+    throw new Error(`Не удалось обновить файл ${filePath} в ${targetGit.name}: ${gitRes.error || 'ошибка Git'}`);
   }
+  const rawUrl = gitRes.rawUrl || buildGitRawUrl(targetGit, filePath);
+  if (!rawUrl) {
+    throw new Error(`Git-источник «${targetGit.name}» не вернул URL обновлённого файла ${filePath}`);
+  }
+  if (gitRes.sha) {
+    gitFileMetadataCache.set(filePath.replace(/^\/+/, ''), {
+      sha: gitRes.sha,
+      contentHash,
+      rawUrl,
+      lastUpdated: Date.now(),
+    });
+  }
+
+  const now = new Date().toISOString();
+  user.subscriptionSourceId = targetGit.id;
+  user.gitFilePath = filePath;
+  user.gitRawUrl = rawUrl;
+  if (!store.repoFiles) store.repoFiles = [];
+  let repoFile = store.repoFiles.find((item) => item.sourceId === targetGit.id && item.filePath === filePath);
+  if (!repoFile) {
+    repoFile = {
+      sourceId: targetGit.id,
+      userId: user.id,
+      telegramId: user.telegramId,
+      username: user.username,
+      firstName: user.firstName,
+      filePath,
+      rawUrl,
+      updatedAt: now,
+      format,
+      finalUrl: user.finalSubscriptionUrl || '',
+      sizeBytes,
+      isPoolFree: false,
+      lastCheckedAt: now,
+      httpStatus: 200,
+      isAccessible: true,
+      nodesFound: stats.total,
+      contentHash,
+    };
+    store.repoFiles.push(repoFile);
+  } else {
+    Object.assign(repoFile, {
+      userId: user.id,
+      telegramId: user.telegramId,
+      username: user.username,
+      firstName: user.firstName,
+      rawUrl,
+      format,
+      sizeBytes,
+      nodesFound: stats.total,
+      contentHash,
+      updatedAt: now,
+      lastCheckedAt: now,
+    });
+  }
+  if (gitRes.sha) repoFile.sha = gitRes.sha;
+
+  let finalUrl: string;
+  try {
+    finalUrl = await refreshUserSubscriptionLink(user, targetGit.id, filePath, rawUrl, format);
+  } catch (error: any) {
+    repoFile.contentHash = '';
+    user.isInconsistent = true;
+    user.inconsistencyReason = `Файл обновлен, но ссылка подписки не обновилась: ${error.message}`;
+    user.syncHealthStatus = 'red';
+    saveStore();
+    throw error;
+  }
+  repoFile.finalUrl = finalUrl;
 
   user.isInconsistent = false;
   user.inconsistencyReason = undefined;
@@ -4172,7 +4299,7 @@ async function forceResyncSubscriber(user: BotUser): Promise<{ success: boolean;
 
   return {
     success: true,
-    message: `Конфигурация пользователя @${user.username || user.telegramId} успешно принудительно согласована с центральным источником (${stats.total} узлов)!`,
+    message: `Конфигурация @${user.username || user.telegramId} обновлена в источнике «${targetGit.name}» (${stats.total} узлов); ссылка подписки тоже обновлена.`,
     user,
     nodesCount: stats.total,
   };

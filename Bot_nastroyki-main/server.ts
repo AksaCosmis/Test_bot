@@ -1145,6 +1145,13 @@ function normalizeStore(parsed: any): StoreData {
     );
     parsed.centralFile.repositoryUrl = buildGitRepositoryWebUrl(source);
   }
+  if (activeSource?.provider === 'sourcecraft' && parsed.centralFile) {
+    const stableCentralRawUrl = buildGitRawUrl(activeSource, parsed.centralFile.filename || activeSource.filePath || 'L');
+    if (stableCentralRawUrl) {
+      parsed.centralFile.centralRawUrl = stableCentralRawUrl;
+      activeSource.centralRawUrl = stableCentralRawUrl;
+    }
+  }
   if (parsed.centralFile) {
     parsed.centralFile.botDeletedStubContent = parsed.centralFile.botDeletedStubContent || defaultStore.centralFile.botDeletedStubContent;
     parsed.centralFile.botDeletedBlockHours = parsed.centralFile.botDeletedBlockHours ?? defaultStore.centralFile.botDeletedBlockHours;
@@ -1834,7 +1841,8 @@ function getFullSubscriptionContent(user?: BotUser | null, exclusion?: Exclusion
     if (user.status === 'muted' || user.isMuted) {
       return getReplacementSourceNodesSync(2);
     }
-    if (user.status === 'channel_inactive' || user.channelMembership === 'left') {
+    if (!user.isAdmin && user.channelMembership !== 'creator' && user.channelMembership !== 'administrator' &&
+      (user.status === 'channel_inactive' || user.channelMembership === 'left')) {
       return getReplacementSourceNodesSync(1);
     }
   }
@@ -1967,11 +1975,7 @@ function buildGitRawUrl(source: GitSourceItem, filePath: string): string {
   const cleanPath = filePath.replace(/^\/+/, '');
 
   if (source.provider === 'sourcecraft') {
-    const cachedSha = gitFileMetadataCache.get(cleanPath)?.sha;
-    if (cachedSha && /^[0-9a-f]{40}$/i.test(cachedSha)) {
-      return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${cachedSha}/${cleanPath}`;
-    }
-    return '';
+    return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${branch}/${cleanPath}`;
   }
 
   if (source.provider === 'custom' && source.baseRawUrl && source.baseRawUrl.toLowerCase().includes(cleanRepo.toLowerCase())) {
@@ -2071,8 +2075,10 @@ function getUserSubscriptionTargetUrl(user: any): string {
     (item: any) => item.sourceId === user.subscriptionSourceId && item.filePath === user.gitFilePath
   ) || user.sourceSubscriptions?.find((item: any) => item.sourceId === user.subscriptionSourceId);
   const source = store.gitSources?.find((item: GitSourceItem) => item.id === user.subscriptionSourceId) || getActiveGitSource();
-  const rawFileUrl = subscription?.rawUrl || user.gitRawUrl ||
-    buildGitRawUrl(source, subscription?.filePath || user.gitFilePath || `subs/${token}.txt`);
+  const filePath = subscription?.filePath || user.gitFilePath || `subs/${token}.txt`;
+  const rawFileUrl = source.provider === 'sourcecraft'
+    ? buildGitRawUrl(source, filePath)
+    : subscription?.rawUrl || user.gitRawUrl || buildGitRawUrl(source, filePath);
   const gatewayActive = Boolean(
     store.relayGatewayConfig?.enabled &&
     store.relayGatewayConfig?.url &&
@@ -2634,9 +2640,7 @@ async function createOrUpdateGitVerseFile(params: {
       });
 
       if (gitCliRes.success) {
-        const effectiveRawUrl = isSourceCraft && gitCliRes.sha
-          ? `https://raw.sourcecraft.tech/raw/${owner}/${repo}/${gitCliRes.sha}/${cleanPath}`
-          : rawUrl;
+        const effectiveRawUrl = rawUrl;
         gitFileMetadataCache.set(cleanPath, {
           sha: gitCliRes.sha,
           contentHash: targetContentHash,
@@ -4186,10 +4190,49 @@ function computeSyncHealthReport() {
 }
 
 // Force re-sync a specific subscriber with central source
+async function pullLatestCentralContent(): Promise<void> {
+  const activeGit = getActiveGitSource();
+  const filePath = store.centralFile.filename || activeGit.filePath || 'L';
+  const rawUrl = activeGit.provider === 'sourcecraft'
+    ? buildGitRawUrl(activeGit, filePath)
+    : store.centralFile.centralRawUrl || activeGit.centralRawUrl || buildGitRawUrl(activeGit, filePath);
+  if (!rawUrl) {
+    throw new Error(`Не настроена RAW-ссылка центрального файла в источнике «${activeGit.name}»`);
+  }
+
+  const response = await fetch(rawUrl, {
+    headers: {
+      'User-Agent': 'PulsAccess/2.0',
+      Accept: 'text/plain, */*',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) {
+    throw new Error(`Не удалось прочитать центральный файл из ${activeGit.name}: HTTP ${response.status}`);
+  }
+  const content = await response.text();
+  if (!content.trim()) {
+    throw new Error(`Центральный файл в источнике «${activeGit.name}» пуст; синхронизация отменена`);
+  }
+
+  const previousHash = crypto.createHash('sha256').update(store.centralFile.content || '').digest('hex');
+  const latestHash = crypto.createHash('sha256').update(content).digest('hex');
+  if (previousHash !== latestHash) {
+    store.centralFile.content = content;
+    store.centralFile.centralRawUrl = rawUrl;
+    store.centralFile.lastUpdatedAt = new Date().toISOString();
+    store.centralFile.lastCommitMessage = `Pulled before subscriber force-resync from ${activeGit.name}`;
+    saveStore();
+  }
+}
+
 async function forceResyncSubscriber(user: BotUser): Promise<{ success: boolean; message: string; user: BotUser; nodesCount: number }> {
   const activeGit = getActiveGitSource();
   const targetGit = store.gitSources?.find((source) => source.id === user.subscriptionSourceId) || activeGit;
   const format = user.subscriptionType === 'happ' ? 'happ' : 'incy';
+  await pullLatestCentralContent();
   const tokenSafe = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
   const sourceSubscription = user.sourceSubscriptions?.find(
     (subscription) => subscription.sourceId === targetGit.id && subscription.filePath === user.gitFilePath
@@ -10240,7 +10283,17 @@ async function evaluateUserSubscriptionStatus(
   let isChannelSubscriber = user.channelMembership !== 'left' && user.status !== 'channel_inactive';
   if (user.isAdmin || user.channelMembership === 'creator' || user.channelMembership === 'administrator' || user.bypassBlock) {
     isChannelSubscriber = true;
-    user.channelMembership = user.channelMembership === 'creator' ? 'creator' : 'member';
+    user.channelMembership = user.channelMembership === 'creator'
+      ? 'creator'
+      : (user.isAdmin || user.channelMembership === 'administrator' ? 'administrator' : 'member');
+    if (['channel_inactive', 'unsubscribed'].includes(user.status) && !user.isBlocked) {
+      user.status = 'active';
+      user.hasActiveSubscription = Boolean(user.gitFilePath || user.finalSubscriptionUrl || user.hasActiveSubscription);
+      user.channelLeftAt = null;
+      user.deletionDeadlineAt = null;
+      user.subscriptionStatusReason = undefined;
+      saveStore();
+    }
   } else if (activeBot && activeBot.token && user.telegramId) {
     try {
       const checkRes = await botManager.checkAllRequiredChannels(activeBot, user.telegramId);
@@ -10761,6 +10814,9 @@ function setUnlimitedSubscriptionHeaders(
 // 10. Public Subscription Serving Endpoint with Replacement Enforcement (/api/sub/:token and /sub/:token)
 app.get(['/api/sub/:token', '/sub/:token'], async (req, res) => {
   const { token } = req.params;
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   const format = req.query.format as string;
   const userAgent = (req.headers['user-agent'] || '').toLowerCase();
   const reqCookieId = (req.headers['cookie'] || '').match(/__sub_dev_id=([a-zA-Z0-9_-]+)/)?.[1];

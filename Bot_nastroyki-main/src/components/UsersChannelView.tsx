@@ -611,6 +611,11 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
     return selected ? color.active : color.idle;
   };
 
+  const isChannelAdminUser = (user: BotUser) =>
+    Boolean(user.isAdmin || ['creator', 'administrator'].includes(user.channelMembership));
+  const isChannelLeftUser = (user: BotUser) =>
+    !isChannelAdminUser(user) && (user.channelMembership === 'left' || user.status === 'channel_inactive');
+
   const filteredUsers = users.filter((u) => {
     const sourceMatches = sourceFilter === 'all' ||
       u.sourceSubscriptions?.some((subscription) => subscription.sourceId === sourceFilter) ||
@@ -625,13 +630,13 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
     if (filterTab === 'inconsistent') return matchesSearch && checkUserInconsistent(u).isInconsistent;
     if (filterTab === 'active') return matchesSearch && u.status === 'active' && !u.isBlocked;
     if (filterTab === 'admins') return matchesSearch && (u.isAdmin || ['creator', 'administrator'].includes(u.channelMembership));
-    if (filterTab === 'tier1') return matchesSearch && (u.channelMembership === 'left' || u.status === 'channel_inactive' || u.status === 'bot_blocked' || u.status === 'unsubscribed');
+    if (filterTab === 'tier1') return matchesSearch && (isChannelLeftUser(u) || u.status === 'bot_blocked' || (u.status === 'unsubscribed' && !isChannelAdminUser(u)));
     if (filterTab === 'tier2') return matchesSearch && ((u.status === 'muted' || (u.mutedUntil && new Date(u.mutedUntil) > new Date())) && !u.isBlocked);
     if (filterTab === 'tier3') return matchesSearch && (u.isBlocked || u.status === 'blocked' || (u.deviceViolationAttempts && u.deviceViolationAttempts >= 3));
     if (filterTab === 'device_locked') return matchesSearch && (u.deviceLocked || !!u.boundDevice);
     if (filterTab === 'muted') return matchesSearch && u.status === 'muted';
     if (filterTab === 'blocked') return matchesSearch && (u.status === 'blocked' || u.isBlocked);
-    if (filterTab === 'channel_left') return matchesSearch && (u.channelMembership === 'left' || u.status === 'channel_inactive');
+    if (filterTab === 'channel_left') return matchesSearch && isChannelLeftUser(u);
     if (filterTab === 'channel_exclusion') return matchesSearch && Boolean(u.isChannelExclusion);
     return matchesSearch;
   });
@@ -830,7 +835,7 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
                 filterTab === 'tier1' ? 'bg-stone-800 text-white' : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
               }`}
             >
-              <span>Уровень 1: Отписка ({users.filter(u => u.channelMembership === 'left' || u.status === 'channel_inactive' || u.status === 'bot_blocked' || u.status === 'unsubscribed').length})</span>
+              <span>Уровень 1: Отписка ({users.filter(u => isChannelLeftUser(u) || u.status === 'bot_blocked' || (u.status === 'unsubscribed' && !isChannelAdminUser(u))).length})</span>
             </button>
             <button
               onClick={() => setFilterTab('tier2')}
@@ -1138,9 +1143,9 @@ export const UsersChannelView: React.FC<UsersChannelViewProps> = ({
               {filteredUsers.map((u) => {
                 const isMuted = u.status === 'muted';
                 const isBlocked = u.status === 'blocked' || u.isBlocked;
-                const isLeft = u.channelMembership === 'left' || u.status === 'channel_inactive';
+                const isLeft = isChannelLeftUser(u);
                 const isBotBlocked = u.status === 'bot_blocked';
-                const isSuspended = isLeft || isBotBlocked || u.status === 'unsubscribed';
+                const isSuspended = isLeft || isBotBlocked || (u.status === 'unsubscribed' && !isChannelAdminUser(u));
                 const receivedText = u.receivedAt ? new Date(u.receivedAt).toLocaleString('ru-RU') : 'Ещё не получена';
                 const isSelected = selectedUserIds.has(u.id);
                 const userSource = subscriptionSources.find((source) => source.id === getUserSourceId(u));

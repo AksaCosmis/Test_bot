@@ -213,6 +213,8 @@ export class TelegramBotManager {
       if (!bot.token) continue;
       for (const ch of (bot.channels || [])) {
         if (!ch.id) continue;
+        const channelAdminIds = new Set<number>();
+        let adminListVerified = false;
         let cleanChannel = ch.id.trim();
         if (!cleanChannel.startsWith('@') && !cleanChannel.startsWith('-')) {
           cleanChannel = /^\d+$/.test(cleanChannel) ? `-${cleanChannel}` : `@${cleanChannel}`;
@@ -242,9 +244,11 @@ export class TelegramBotManager {
         try {
           const adminsRes = await this.tgApi(bot.token, 'getChatAdministrators', { chat_id: cleanChannel });
           if (adminsRes && adminsRes.ok && Array.isArray(adminsRes.result)) {
+            adminListVerified = true;
             ch.isBotAdmin = true;
             for (const adm of adminsRes.result) {
               if (adm.user && !adm.user.is_bot) {
+                channelAdminIds.add(adm.user.id);
                 const existing = store.users.find((u: any) => u.telegramId === adm.user.id);
                 if (!existing) {
                   const newUser = this.findOrCreateUser(adm.user);
@@ -252,8 +256,29 @@ export class TelegramBotManager {
                   newUser.isAdmin = true;
                   newUsersAdded++;
                 } else {
+                  const needsChannelRestore =
+                    existing.channelMembership === 'left' ||
+                    ['channel_inactive', 'unsubscribed'].includes(existing.status);
                   existing.channelMembership = adm.status === 'creator' ? 'creator' : 'administrator';
                   existing.isAdmin = true;
+                  if (
+                    needsChannelRestore &&
+                    !existing.isBlocked &&
+                    existing.status !== 'blocked'
+                  ) {
+                    existing.status = 'active';
+                    existing.hasActiveSubscription = Boolean(existing.gitFilePath || existing.finalSubscriptionUrl || existing.hasActiveSubscription);
+                    existing.channelLeftAt = null;
+                    existing.deletionDeadlineAt = null;
+                    existing.subscriptionStatusReason = undefined;
+                    if (existing.gitFilePath) {
+                      try {
+                        await this.options.restoreUserNodes(existing);
+                      } catch (err: any) {
+                        console.warn(`[Channel Admin Restore] Failed to restore ${existing.telegramId}:`, err.message);
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -264,11 +289,44 @@ export class TelegramBotManager {
 
         // 4. Verify all registered store users against this channel
         for (const user of store.users) {
-          if (user.isException || user.isAdmin || user.channelMembership === 'creator') continue;
+          if (user.isException) continue;
           try {
             const check = await this.checkChatMember(bot.token, cleanChannel, user.telegramId);
             if (check.ok) {
-              user.channelMembership = check.isMember ? 'member' : 'left';
+              if (check.isMember) {
+                const needsChannelRestore =
+                  user.channelMembership === 'left' ||
+                  ['channel_inactive', 'unsubscribed'].includes(user.status);
+                user.channelMembership = check.status === 'creator'
+                  ? 'creator'
+                  : check.status === 'administrator'
+                    ? 'administrator'
+                    : 'member';
+                if (check.status === 'creator' || check.status === 'administrator') user.isAdmin = true;
+                if (needsChannelRestore && !user.isBlocked && user.status !== 'blocked') {
+                  user.status = 'active';
+                  user.hasActiveSubscription = Boolean(user.gitFilePath || user.finalSubscriptionUrl || user.hasActiveSubscription);
+                  user.channelLeftAt = null;
+                  user.deletionDeadlineAt = null;
+                  user.subscriptionStatusReason = undefined;
+                  if (user.gitFilePath) {
+                    try {
+                      await this.options.restoreUserNodes(user);
+                    } catch (err: any) {
+                      console.warn(`[Channel Member Restore] Failed to restore ${user.telegramId}:`, err.message);
+                    }
+                  }
+                }
+              } else {
+                user.channelMembership = 'left';
+                if (
+                  check.status === 'left' ||
+                  check.status === 'kicked' ||
+                  (adminListVerified && !channelAdminIds.has(user.telegramId))
+                ) {
+                  user.isAdmin = false;
+                }
+              }
             }
           } catch {}
         }
@@ -331,7 +389,7 @@ export class TelegramBotManager {
     token: string, 
     channelId: string, 
     userId: number
-  ): Promise<{ ok: boolean; isMember: boolean; botNeedsAdmin?: boolean; errorDescription?: string }> {
+  ): Promise<{ ok: boolean; isMember: boolean; status?: string; botNeedsAdmin?: boolean; errorDescription?: string }> {
     try {
       let cleanChannel = channelId.trim();
       // Remove any https://t.me/ or t.me/ prefixes
@@ -359,7 +417,7 @@ export class TelegramBotManager {
           ['creator', 'administrator', 'member'].includes(st) ||
           (st === 'restricted' && res.result.is_member === true);
         console.log(`[checkChatMember] User ${userId} in ${cleanChannel}: status="${st}" -> isMember=${isMember}`);
-        return { ok: true, isMember };
+        return { ok: true, isMember, status: st };
       }
 
       // Check if Telegram returned 400 because user is not a participant or bot lacks rights
@@ -649,6 +707,8 @@ export class TelegramBotManager {
       : (newStatus === 'creator' ? 'creator' : (newStatus === 'administrator' ? 'administrator' : 'member'));
     if (newStatus === 'creator' || newStatus === 'administrator') {
       user.isAdmin = true;
+    } else if (isLeft) {
+      user.isAdmin = false;
     }
 
     if (user.isException) {
@@ -722,7 +782,9 @@ export class TelegramBotManager {
   public async handleUserJoinedChannel(bot: any, user: any, channel?: any) {
     const { allSubscribed } = await this.checkAllRequiredChannels(bot, user.telegramId);
     if (allSubscribed) {
-      user.channelMembership = 'member';
+      user.channelMembership = user.channelMembership === 'creator'
+        ? 'creator'
+        : (user.isAdmin || user.channelMembership === 'administrator' ? 'administrator' : 'member');
       user.channelLeftAt = null;
       user.deletionDeadlineAt = null;
 
@@ -1009,7 +1071,9 @@ export class TelegramBotManager {
       });
       return;
     } else {
-      user.channelMembership = user.channelMembership === 'creator' ? 'creator' : 'member';
+      user.channelMembership = user.channelMembership === 'creator'
+        ? 'creator'
+        : (user.isAdmin || user.channelMembership === 'administrator' ? 'administrator' : 'member');
       if (user.status === 'channel_inactive' || (user.isBlocked && user.subscriptionStatusReason?.includes('канал'))) {
         user.status = 'active';
         user.isBlocked = false;
@@ -1174,7 +1238,9 @@ export class TelegramBotManager {
       }
 
       // User verified in all channels!
-      user.channelMembership = 'member';
+      user.channelMembership = user.channelMembership === 'creator'
+        ? 'creator'
+        : (user.isAdmin || user.channelMembership === 'administrator' ? 'administrator' : 'member');
       user.channelLeftAt = null;
       user.deletionDeadlineAt = null;
 

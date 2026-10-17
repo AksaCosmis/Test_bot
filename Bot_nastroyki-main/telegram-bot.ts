@@ -462,7 +462,7 @@ export class TelegramBotManager {
   ): Promise<{ allSubscribed: boolean; missingChannels: any[]; botNeedsAdminIn: any[]; errors: string[] }> {
     const store = this.options.getStore();
     const user = store.users?.find((u: any) => u.telegramId === userId);
-    if (user?.isAdmin || user?.isException || user?.channelMembership === 'creator' || user?.channelMembership === 'administrator' || user?.bypassBlock) {
+    if (user?.isException || user?.bypassBlock) {
       return { allSubscribed: true, missingChannels: [], botNeedsAdminIn: [], errors: [] };
     }
 
@@ -477,6 +477,18 @@ export class TelegramBotManager {
 
     for (const ch of requiredChannels) {
       const check = await this.checkChatMember(bot.token, ch.id, userId);
+      if (user && check.ok) {
+        if (check.isMember && (check.status === 'creator' || check.status === 'administrator')) {
+          user.channelMembership = check.status;
+          user.isAdmin = true;
+        } else if (!check.isMember && (check.status === 'left' || check.status === 'kicked')) {
+          user.channelMembership = 'left';
+          user.isAdmin = false;
+        } else if (check.isMember && user.channelMembership === 'left') {
+          user.channelMembership = 'member';
+          user.isAdmin = false;
+        }
+      }
       if (check.botNeedsAdmin) {
         botNeedsAdminIn.push(ch);
       }

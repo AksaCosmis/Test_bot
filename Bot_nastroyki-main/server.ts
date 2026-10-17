@@ -1136,7 +1136,7 @@ function normalizeStore(parsed: any): StoreData {
     });
     parsed.centralFile.filename = filename;
     parsed.centralFile.centralRawUrl = configuredRawUrl || (
-      source.provider === 'sourcecraft' ? `https://raw.sourcecraft.tech/raw/${repository}/${branch}/${filename}` :
+      source.provider === 'sourcecraft' ? '' :
       source.provider === 'gitflic' ? `https://gitflic.ru/project/${repository}/blob/raw?file=${encodeURIComponent(filename)}` :
       source.provider === 'moshub' ? `https://hub.mos.ru/${repository}/-/raw/${branch}/${filename}` :
       source.provider === 'github' ? `https://raw.githubusercontent.com/${repository}/${branch}/${filename}` :
@@ -1144,13 +1144,6 @@ function normalizeStore(parsed: any): StoreData {
       `https://gitverse.ru/api/repos/${repository}/raw/branch/${branch}/${filename}`
     );
     parsed.centralFile.repositoryUrl = buildGitRepositoryWebUrl(source);
-  }
-  if (activeSource?.provider === 'sourcecraft' && parsed.centralFile) {
-    const stableCentralRawUrl = buildGitRawUrl(activeSource, parsed.centralFile.filename || activeSource.filePath || 'L');
-    if (stableCentralRawUrl) {
-      parsed.centralFile.centralRawUrl = stableCentralRawUrl;
-      activeSource.centralRawUrl = stableCentralRawUrl;
-    }
   }
   if (parsed.centralFile) {
     parsed.centralFile.botDeletedStubContent = parsed.centralFile.botDeletedStubContent || defaultStore.centralFile.botDeletedStubContent;
@@ -1975,7 +1968,10 @@ function buildGitRawUrl(source: GitSourceItem, filePath: string): string {
   const cleanPath = filePath.replace(/^\/+/, '');
 
   if (source.provider === 'sourcecraft') {
-    return `https://raw.sourcecraft.tech/raw/${cleanRepo}/${branch}/${cleanPath}`;
+    const cachedSha = gitFileMetadataCache.get(cleanPath)?.sha;
+    return cachedSha && /^[0-9a-f]{40}$/i.test(cachedSha)
+      ? `https://raw.sourcecraft.tech/raw/${cleanRepo}/${cachedSha}/${cleanPath}`
+      : '';
   }
 
   if (source.provider === 'custom' && source.baseRawUrl && source.baseRawUrl.toLowerCase().includes(cleanRepo.toLowerCase())) {
@@ -2076,18 +2072,16 @@ function getUserSubscriptionTargetUrl(user: any): string {
   ) || user.sourceSubscriptions?.find((item: any) => item.sourceId === user.subscriptionSourceId);
   const source = store.gitSources?.find((item: GitSourceItem) => item.id === user.subscriptionSourceId) || getActiveGitSource();
   const filePath = subscription?.filePath || user.gitFilePath || `subs/${token}.txt`;
-  const rawFileUrl = source.provider === 'sourcecraft'
-    ? buildGitRawUrl(source, filePath)
-    : subscription?.rawUrl || user.gitRawUrl || buildGitRawUrl(source, filePath);
   const gatewayActive = Boolean(
     store.relayGatewayConfig?.enabled &&
     store.relayGatewayConfig?.url &&
     store.relayGatewayConfig?.isOnline === true &&
     store.relayGatewayConfig?.lastTestStatus === 'success'
   );
-  return gatewayActive
-    ? `${store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')}/api/sub/${token}`
-    : rawFileUrl;
+  const subscriptionBaseUrl = gatewayActive
+    ? store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')
+    : getDirectAppBaseUrl();
+  return `${subscriptionBaseUrl}/api/sub/${token}`;
 }
 
 function applyUserIncyShortUrl(user: any, targetUrl: string, shortUrl: string): void {
@@ -2150,15 +2144,14 @@ async function refreshUserSubscriptionLink(
   format: 'happ' | 'incy'
 ): Promise<string> {
   const token = user.subscriptionToken || `sub_${user.username || user.telegramId}`;
-  const gatewayActive = Boolean(
+  const subscriptionBaseUrl =
     store.relayGatewayConfig?.enabled &&
     store.relayGatewayConfig?.url &&
     store.relayGatewayConfig?.isOnline === true &&
     store.relayGatewayConfig?.lastTestStatus === 'success'
-  );
-  const targetUrl = gatewayActive
-    ? `${store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')}/api/sub/${token}`
-    : rawUrl;
+      ? store.relayGatewayConfig.url.trim().replace(/\/+$/, '')
+      : getDirectAppBaseUrl();
+  const targetUrl = `${subscriptionBaseUrl}/api/sub/${token}`;
 
   user.subscriptionSourceId = sourceId;
   user.gitFilePath = filePath;
@@ -2640,7 +2633,9 @@ async function createOrUpdateGitVerseFile(params: {
       });
 
       if (gitCliRes.success) {
-        const effectiveRawUrl = rawUrl;
+        const effectiveRawUrl = isSourceCraft && gitCliRes.sha
+          ? `https://raw.sourcecraft.tech/raw/${owner}/${repo}/${gitCliRes.sha}/${cleanPath}`
+          : rawUrl;
         gitFileMetadataCache.set(cleanPath, {
           sha: gitCliRes.sha,
           contentHash: targetContentHash,
@@ -2969,15 +2964,14 @@ async function ensureUserRepoFile(
   }
 
   let finalUrl = '';
-  const gatewayActive = Boolean(
+  const subscriptionBaseUrl =
     store.relayGatewayConfig?.enabled &&
     store.relayGatewayConfig?.url &&
     store.relayGatewayConfig?.isOnline === true &&
     store.relayGatewayConfig?.lastTestStatus === 'success'
-  );
-  const targetBaseUrl = gatewayActive
-    ? `${store.relayGatewayConfig?.url?.trim().replace(/\/+$/, '')}/api/sub/${tokenSafe}`
-    : gitRawUrl;
+      ? store.relayGatewayConfig.url.trim().replace(/\/+$/, '')
+      : getDirectAppBaseUrl();
+  const targetBaseUrl = `${subscriptionBaseUrl}/api/sub/${tokenSafe}`;
   if (format === 'happ') {
     // HAPP receives a crypt4 deep link wrapping the assigned source URL.
     finalUrl = buildHappCryptUrl(targetBaseUrl);
@@ -10299,7 +10293,14 @@ async function evaluateUserSubscriptionStatus(
       const checkRes = await botManager.checkAllRequiredChannels(activeBot, user.telegramId);
       if (checkRes && checkRes.allSubscribed) {
         isChannelSubscriber = true;
-        user.channelMembership = 'member';
+        if (['channel_inactive', 'unsubscribed'].includes(user.status) && !user.isBlocked) {
+          user.status = 'active';
+          user.hasActiveSubscription = Boolean(user.gitFilePath || user.finalSubscriptionUrl || user.hasActiveSubscription);
+          user.channelLeftAt = null;
+          user.deletionDeadlineAt = null;
+          user.subscriptionStatusReason = undefined;
+          saveStore();
+        }
       } else if (checkRes && !checkRes.allSubscribed && checkRes.botNeedsAdminIn.length === 0 && checkRes.errors.length === 0) {
         // Only mark as missing if the bot has confirmed rights and verified non-membership
         isChannelSubscriber = false;
